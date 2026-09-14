@@ -53,6 +53,26 @@ function localClockTime(timeZone) {
   return `${hour}:${minute}`;
 }
 
+// Turns a campus's typed address into the lat/long that drives its
+// drop-off/pick-up geofence (see DropoffPickupScreen.tsx in the mobile
+// app). OpenStreetMap's Nominatim is free and needs no API key/billing —
+// a descriptive User-Agent is required by their usage policy. Isolated
+// in one function so swapping to a paid provider later is a one-place change.
+const NOMINATIM_USER_AGENT = 'school-dropoff-pickup/1.0 (admin-configured campus geocoding)';
+async function geocodeAddress(address) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`;
+  let response;
+  try {
+    response = await fetch(url, { headers: { 'User-Agent': NOMINATIM_USER_AGENT } });
+  } catch {
+    throw new Error('Could not verify that address right now. Please try again.');
+  }
+  if (!response.ok) throw new Error('Could not verify that address right now. Please try again.');
+  const [result] = await response.json();
+  if (!result) throw new Error('That address could not be found. Please check it and try again.');
+  return { latitude: Number(result.lat), longitude: Number(result.lon) };
+}
+
 // Higher than Express's 100kb default so a student photo (sent as a
 // base64 data URL in the JSON body — no file-upload middleware in this
 // app) actually fits.
@@ -172,14 +192,15 @@ const studentSelect = `
     s.status, s.pickup_status AS "pickupStatus", e.school_year_id AS "schoolYearId",
     e.grade_level_id AS "gradeLevelId", g.name AS "gradeName", e.class_id AS "classId",
     c.name AS "className", c.teacher_user_id AS "teacherId", s.school_id AS "schoolId",
-    s.campus_id AS "campusId", sc.name AS "schoolName", cp.name AS "campusName"
+    s.campus_id AS "campusId", sc.name AS "schoolName", cp.name AS "campusName",
+    cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius"
   FROM students s LEFT JOIN student_enrollments e ON e.student_id=s.id
   LEFT JOIN school_years y ON y.id=e.school_year_id LEFT JOIN grade_levels g ON g.id=e.grade_level_id
   LEFT JOIN classes c ON c.id=e.class_id LEFT JOIN schools sc ON sc.id=s.school_id
   LEFT JOIN campuses cp ON cp.id=s.campus_id`;
 
 app.get('/api/me/students', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
-  const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,sc.name,cp.name ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
+  const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,sc.name,cp.name,cp.latitude,cp.longitude,cp.geofence_radius ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
   res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare) })));
 }));
 
@@ -218,12 +239,23 @@ const guardianLinkQuery = db.prepare(`
   SELECT sg.can_pick_up AS "canPickUp" FROM student_guardians sg
   JOIN guardians gu ON gu.id=sg.guardian_id WHERE sg.student_id=? AND gu.user_id=?`);
 const studentContextQuery = db.prepare(`
-  SELECT s.school_id AS "schoolId", s.campus_id AS "campusId", c.teacher_user_id AS "teacherId", e.class_id AS "classId", s.pickup_status AS "pickupStatus"
+  SELECT s.school_id AS "schoolId", s.campus_id AS "campusId", c.teacher_user_id AS "teacherId", e.class_id AS "classId", s.pickup_status AS "pickupStatus",
+    cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius"
   FROM students s
   LEFT JOIN student_enrollments e ON e.student_id=s.id
   LEFT JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
   LEFT JOIN classes c ON c.id=e.class_id
+  LEFT JOIN campuses cp ON cp.id=s.campus_id
   WHERE s.id=? AND s.status='ACTIVE'`);
+
+function distanceMeters(a, b) {
+  const radians = degrees => degrees * Math.PI / 180;
+  const dLat = radians(b.latitude - a.latitude);
+  const dLon = radians(b.longitude - a.longitude);
+  const lat1 = radians(a.latitude); const lat2 = radians(b.latitude);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
 
 async function createQueueRequest(req, res, requestType, requiredStatus, nextStatus) {
   const link = await guardianLinkQuery.get(req.params.studentId, req.user.id);
@@ -235,6 +267,16 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
   if (!context) return res.status(404).json({ error: 'Student not found.' });
   if (context.pickupStatus !== requiredStatus) {
     return res.status(409).json({ error: `This student isn't currently ${requiredStatus === 'AT_HOME' ? 'at home' : 'present'}.` });
+  }
+  if (context.latitude != null && context.longitude != null) {
+    const latitude = Number(req.body.latitude); const longitude = Number(req.body.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+      return res.status(400).json({ error: 'A valid device location is required for drop-off and pick-up.' });
+    }
+    const distance = distanceMeters({ latitude, longitude }, { latitude: context.latitude, longitude: context.longitude });
+    if (distance > (context.geofenceRadius || DEFAULT_GEOFENCE_RADIUS_METERS)) {
+      return res.status(403).json({ error: `You must be at the school location to ${requestType === 'DROP_OFF' ? 'drop off' : 'pick up'} this student.` });
+    }
   }
   try {
     const itemId = id('queue');
@@ -419,7 +461,7 @@ app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin'),
 
 app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   res.json({
-    school: await db.prepare('SELECT id,name,code,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
+    school: await db.prepare('SELECT id,name,code,address,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
     campuses: await db.prepare('SELECT id,name,address,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE school_id=? ORDER BY name').all(req.school.id),
     schoolYears: await db.prepare('SELECT * FROM school_years WHERE school_id=? ORDER BY starts_on DESC').all(req.school.id),
     gradeLevels: await db.prepare('SELECT id,name,sort_order AS "sortOrder",next_grade_level_id AS "nextGradeLevelId" FROM grade_levels ORDER BY sort_order').all(),
@@ -433,57 +475,14 @@ app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin'), as
 const isValidClockTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 
 app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
-  const { name, startTime, dismissalTime, extendedTime } = req.body;
+  const { name, address, startTime, dismissalTime, extendedTime } = req.body;
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
     if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
       return res.status(400).json({ error: `${label} must be a HH:MM time` });
     }
   }
-  const current = await db.prepare('SELECT name,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id);
+  const current = await db.prepare('SELECT name,address,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id);
   if (!current) return res.status(404).json({ error: 'School not found' });
-  // undefined (field omitted) keeps the existing value; '' explicitly clears it.
-  const next = {
-    name: name !== undefined && name.trim() ? name.trim() : current.name,
-    startTime: startTime !== undefined ? (startTime || null) : current.startTime,
-    dismissalTime: dismissalTime !== undefined ? (dismissalTime || null) : current.dismissalTime,
-    extendedTime: extendedTime !== undefined ? (extendedTime || null) : current.extendedTime,
-  };
-  await db.prepare('UPDATE schools SET name=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
-    .run(next.name, next.startTime, next.dismissalTime, next.extendedTime, req.school.id);
-  res.status(204).end();
-}));
-
-// A "location" is a campus — some schools run more than one site with
-// its own bell schedule (e.g. an early-childhood building vs the main
-// campus), so each gets its own start/dismissal/extended time, same
-// shape as the school-wide profile above.
-app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
-  const { name, address, startTime, dismissalTime, extendedTime } = req.body;
-  if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
-  for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
-    if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
-      return res.status(400).json({ error: `${label} must be a HH:MM time` });
-    }
-  }
-  const campusId = id('campus');
-  try {
-    await db.prepare('INSERT INTO campuses (id,school_id,name,address,start_time,dismissal_time,extended_time) VALUES (?,?,?,?,?,?,?)')
-      .run(campusId, req.school.id, name.trim(), address?.trim() || null, startTime || null, dismissalTime || null, extendedTime || null);
-    res.status(201).json({ id: campusId });
-  } catch (error) {
-    res.status(400).json({ error: isUniqueViolation(error) ? 'A location with that name already exists' : error.message });
-  }
-}));
-
-app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
-  const { name, address, startTime, dismissalTime, extendedTime } = req.body;
-  for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
-    if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
-      return res.status(400).json({ error: `${label} must be a HH:MM time` });
-    }
-  }
-  const current = await db.prepare('SELECT name,address,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
-  if (!current) return res.status(404).json({ error: 'Location not found' });
   // undefined (field omitted) keeps the existing value; '' explicitly clears it.
   const next = {
     name: name !== undefined && name.trim() ? name.trim() : current.name,
@@ -492,9 +491,89 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
     dismissalTime: dismissalTime !== undefined ? (dismissalTime || null) : current.dismissalTime,
     extendedTime: extendedTime !== undefined ? (extendedTime || null) : current.extendedTime,
   };
+  await db.prepare('UPDATE schools SET name=?, address=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
+    .run(next.name, next.address, next.startTime, next.dismissalTime, next.extendedTime, req.school.id);
+  res.status(204).end();
+}));
+
+// A "location" is a campus — some schools run more than one site with
+// its own bell schedule (e.g. an early-childhood building vs the main
+// campus), so each gets its own start/dismissal/extended time, same
+// shape as the school-wide profile above.
+// Default radius (meters) for a newly created location's drop-off/pick-up
+// geofence — wide enough to cover a parking lot/curb without requiring the
+// admin to pick a number up front; editable afterward in School Setup.
+const DEFAULT_GEOFENCE_RADIUS_METERS = 150;
+
+app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
+  if (!address?.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
+  for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
+    if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
+      return res.status(400).json({ error: `${label} must be a HH:MM time` });
+    }
+  }
+  const radius = geofenceRadius === undefined || geofenceRadius === null || geofenceRadius === '' ? DEFAULT_GEOFENCE_RADIUS_METERS : Number(geofenceRadius);
+  if (!Number.isFinite(radius) || radius <= 0) return res.status(400).json({ error: 'geofenceRadius must be a positive number of meters' });
+
+  let coordinates;
   try {
-    await db.prepare('UPDATE campuses SET name=?, address=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
-      .run(next.name, next.address, next.startTime, next.dismissalTime, next.extendedTime, req.params.id);
+    coordinates = await geocodeAddress(address.trim());
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  const campusId = id('campus');
+  try {
+    await db.prepare('INSERT INTO campuses (id,school_id,name,address,latitude,longitude,geofence_radius,start_time,dismissal_time,extended_time) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .run(campusId, req.school.id, name.trim(), address.trim(), coordinates.latitude, coordinates.longitude, radius, startTime || null, dismissalTime || null, extendedTime || null);
+    res.status(201).json({ id: campusId, latitude: coordinates.latitude, longitude: coordinates.longitude });
+  } catch (error) {
+    res.status(400).json({ error: isUniqueViolation(error) ? 'A location with that name already exists' : error.message });
+  }
+}));
+
+app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
+  if (address !== undefined && !address.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
+  for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
+    if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
+      return res.status(400).json({ error: `${label} must be a HH:MM time` });
+    }
+  }
+  if (geofenceRadius !== undefined && geofenceRadius !== null && geofenceRadius !== '' && !(Number(geofenceRadius) > 0)) {
+    return res.status(400).json({ error: 'geofenceRadius must be a positive number of meters' });
+  }
+  const current = await db.prepare('SELECT name,address,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
+  if (!current) return res.status(404).json({ error: 'Location not found' });
+
+  // Re-geocode only when the address actually changed — avoids an
+  // unnecessary Nominatim call (and failure risk) on every unrelated edit.
+  const nextAddress = address !== undefined ? address.trim() : current.address;
+  let coordinates = { latitude: current.latitude, longitude: current.longitude };
+  if (address !== undefined && nextAddress !== current.address) {
+    try {
+      coordinates = await geocodeAddress(nextAddress);
+    } catch (error) {
+      return res.status(400).json({ error: error.message });
+    }
+  }
+
+  // undefined (field omitted) keeps the existing value; '' explicitly clears it (time fields only — address is required, so it can't be cleared this way).
+  const next = {
+    name: name !== undefined && name.trim() ? name.trim() : current.name,
+    address: nextAddress,
+    latitude: coordinates.latitude,
+    longitude: coordinates.longitude,
+    geofenceRadius: geofenceRadius !== undefined && geofenceRadius !== null && geofenceRadius !== '' ? Number(geofenceRadius) : current.geofenceRadius,
+    startTime: startTime !== undefined ? (startTime || null) : current.startTime,
+    dismissalTime: dismissalTime !== undefined ? (dismissalTime || null) : current.dismissalTime,
+    extendedTime: extendedTime !== undefined ? (extendedTime || null) : current.extendedTime,
+  };
+  try {
+    await db.prepare('UPDATE campuses SET name=?, address=?, latitude=?, longitude=?, geofence_radius=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
+      .run(next.name, next.address, next.latitude, next.longitude, next.geofenceRadius, next.startTime, next.dismissalTime, next.extendedTime, req.params.id);
     res.status(204).end();
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'A location with that name already exists' : error.message });

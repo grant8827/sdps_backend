@@ -273,6 +273,13 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 14,
+    name: 'school-wide mailing address, separate from each campus/location address',
+    async up(db) {
+      await db.exec(`ALTER TABLE schools ADD COLUMN IF NOT EXISTS address TEXT;`);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {
