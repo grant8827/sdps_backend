@@ -17,9 +17,9 @@ const port = process.env.PORT || 3000;
 // browser needs an explicit CORS grant from this API. Accept a comma-separated
 // list so preview and production frontends can both be configured without
 // allowing arbitrary origins.
+const PRODUCTION_FRONTEND_URL = 'https://sdpsfrontend-production.up.railway.app';
 const allowedOrigins = new Set(
-  String(process.env.FRONTEND_URL || '')
-    .split(',')
+  [PRODUCTION_FRONTEND_URL, ...String(process.env.FRONTEND_URL || '').split(',')]
     .map(origin => origin.trim().replace(/\/$/, ''))
     .filter(Boolean),
 );
