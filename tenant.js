@@ -1,9 +1,10 @@
-import { db } from './database.js';
+import { db } from './db.js';
+import { asyncRoute } from './asyncRoute.js';
 
 export function getMemberships(userId) {
   return db.prepare(`
-    SELECT m.id,m.school_id AS schoolId,m.campus_id AS campusId,m.role,
-      s.name AS schoolName,s.code AS schoolCode,c.name AS campusName
+    SELECT m.id,m.school_id AS "schoolId",m.campus_id AS "campusId",m.role,
+      s.name AS "schoolName",s.code AS "schoolCode",c.name AS "campusName"
     FROM memberships m JOIN schools s ON s.id=m.school_id
     LEFT JOIN campuses c ON c.id=m.campus_id
     WHERE m.user_id=? AND m.status='ACTIVE' AND s.status='ACTIVE'
@@ -11,20 +12,20 @@ export function getMemberships(userId) {
   `).all(userId);
 }
 
-export function canAccessSchool(userId, schoolId, allowedRoles = []) {
-  const memberships = getMemberships(userId);
+export async function canAccessSchool(userId, schoolId, allowedRoles = []) {
+  const memberships = await getMemberships(userId);
   const superAdmin = memberships.some(m => m.role === 'platform_super_admin');
-  if (superAdmin) return db.prepare(`SELECT id AS schoolId,name AS schoolName,code AS schoolCode FROM schools WHERE id=? AND status='ACTIVE'`).get(schoolId) || null;
+  if (superAdmin) return (await db.prepare(`SELECT id AS "schoolId",name AS "schoolName",code AS "schoolCode" FROM schools WHERE id=? AND status='ACTIVE'`).get(schoolId)) || null;
   return memberships.find(m => m.schoolId === schoolId && (allowedRoles.length === 0 || allowedRoles.includes(m.role))) || null;
 }
 
 export function requireSchoolAccess(...allowedRoles) {
-  return (req, res, next) => {
-    const memberships = getMemberships(req.user.id);
+  return asyncRoute(async (req, res, next) => {
+    const memberships = await getMemberships(req.user.id);
     const requestedSchoolId = req.headers['x-school-id'] || req.query.schoolId || req.body?.schoolId;
     const superAdmin = memberships.find(m => m.role === 'platform_super_admin');
     if (superAdmin && requestedSchoolId) {
-      const school = db.prepare(`SELECT id FROM schools WHERE id=? AND status='ACTIVE'`).get(requestedSchoolId);
+      const school = await db.prepare(`SELECT id FROM schools WHERE id=? AND status='ACTIVE'`).get(requestedSchoolId);
       if (!school) return res.status(404).json({ error: 'School not found' });
       req.school = { id: requestedSchoolId };
       req.membership = superAdmin;
@@ -36,5 +37,5 @@ export function requireSchoolAccess(...allowedRoles) {
     req.school = { id: requestedSchoolId || membership.schoolId };
     req.membership = membership;
     next();
-  };
+  });
 }

@@ -1,6 +1,6 @@
 # Database migrations
 
-The backend uses additive, versioned migrations managed by `migrations.js` and recorded in `schema_migrations`.
+The backend uses additive, versioned migrations managed by `migrations.js` and recorded in `schema_migrations`, running against PostgreSQL (see `db.js`). The datastore was SQLite (`node:sqlite`) through migration 13; migrations from here on assume Postgres.
 
 ## Migration 1: tenant foundation
 
@@ -15,14 +15,10 @@ Applied September 7, 2026. It:
 
 The intentionally nullable tenant columns are a compatibility stage. They should become required only after all create/update paths and operational tables are tenant-aware and a validation query confirms that no null tenant values remain.
 
-## Rollback checkpoint
-
-The pre-migration SQLite database, WAL, and shared-memory files are stored locally at:
-
-`backend/backups/pre-tenant-2026-09-07/`
-
-The backup directory is ignored by source control because it contains application data. Stop the backend before restoring SQLite files.
-
 ## Current constraint limitation
 
-Some original uniqueness rules are still global, including student number and school-year name. They are stricter than necessary for multiple schools. Changing them requires rebuilding SQLite tables, so that work is deliberately deferred to a separately backed-up migration rather than performed destructively in this migration.
+`student_number` is still globally unique across every school, stricter than necessary for multiple schools sharing one database. `school_years.name` had the same problem but was scoped to `(school_id, name)` in migration 2.
+
+## SQLite → PostgreSQL (2026-09-14)
+
+The backend originally ran on `node:sqlite`'s `DatabaseSync` (synchronous, file-based). It now runs on PostgreSQL via `pg`, both in production (Railway) and local dev — see `db.js` for the connection/query layer and `README`-level setup in `.env.example`. This was a fresh-start port: no SQLite data was migrated, since the local `data/school.db` only ever held seed/dev data. The old `database.js`, its `backend/data/`, and the pre-tenant-migration SQLite backup under `backend/backups/` (all git-ignored, local-only) were removed as part of the port.

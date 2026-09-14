@@ -4,12 +4,13 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node node_modules/nodemon/bin/nodemon.js index.js",
-    "test": "node --test --test-isolation=none"
+    "start": "node --env-file-if-exists=.env index.js",
+    "dev": "node --env-file-if-exists=.env node_modules/nodemon/bin/nodemon.js index.js",
+    "test": "node --env-file-if-exists=.env --test --test-isolation=none"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
