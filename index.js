@@ -268,7 +268,13 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
   if (context.pickupStatus !== requiredStatus) {
     return res.status(409).json({ error: `This student isn't currently ${requiredStatus === 'AT_HOME' ? 'at home' : 'present'}.` });
   }
-  if (context.latitude != null && context.longitude != null) {
+  if (context.latitude == null || context.longitude == null) {
+    return res.status(409).json({ error: 'School location is not configured. Ask the administrator to save the campus address in School Setup.' });
+  }
+  {
+    if (req.body.latitude == null || req.body.longitude == null) {
+      return res.status(400).json({ error: 'A valid device location is required for drop-off and pick-up.' });
+    }
     const latitude = Number(req.body.latitude); const longitude = Number(req.body.longitude);
     if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
       return res.status(400).json({ error: 'A valid device location is required for drop-off and pick-up.' });
@@ -548,11 +554,13 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
   const current = await db.prepare('SELECT name,address,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
   if (!current) return res.status(404).json({ error: 'Location not found' });
 
-  // Re-geocode only when the address actually changed — avoids an
-  // unnecessary Nominatim call (and failure risk) on every unrelated edit.
+  // Re-geocode when the address actually changed, or when it hasn't but
+  // still has no coordinates — a location saved before geofencing existed
+  // has an address with no lat/long yet, and would otherwise never get
+  // one until someone happened to edit the address text itself.
   const nextAddress = address !== undefined ? address.trim() : current.address;
   let coordinates = { latitude: current.latitude, longitude: current.longitude };
-  if (address !== undefined && nextAddress !== current.address) {
+  if (address !== undefined && (nextAddress !== current.address || current.latitude == null || current.longitude == null)) {
     try {
       coordinates = await geocodeAddress(nextAddress);
     } catch (error) {
