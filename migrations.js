@@ -280,6 +280,26 @@ const migrations = [
       await db.exec(`ALTER TABLE schools ADD COLUMN IF NOT EXISTS address TEXT;`);
     },
   },
+  {
+    version: 15,
+    name: 'structured address fields for schools and campus locations',
+    async up(db) {
+      await db.exec(`
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS address_line1 TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS address_line2 TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS city TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS state TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS postal_code TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS country TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS address_line1 TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS address_line2 TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS city TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS state TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS postal_code TEXT;
+        ALTER TABLE campuses ADD COLUMN IF NOT EXISTS country TEXT;
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

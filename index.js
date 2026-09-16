@@ -59,6 +59,39 @@ function localClockTime(timeZone) {
 // a descriptive User-Agent is required by their usage policy. Isolated
 // in one function so swapping to a paid provider later is a one-place change.
 const NOMINATIM_USER_AGENT = 'school-dropoff-pickup/1.0 (admin-configured campus geocoding)';
+
+function parseAddressFields(address) {
+  const fields = { addressLine1: '', addressLine2: '', city: '', state: '', postalCode: '', country: '' };
+  const parts = String(address || '').split(',').map(part => part.trim()).filter(Boolean);
+  if (parts.length >= 5) {
+    fields.country = parts.pop() || '';
+    fields.postalCode = parts.pop() || '';
+    fields.state = parts.pop() || '';
+    fields.city = parts.pop() || '';
+    fields.addressLine1 = parts.shift() || '';
+    fields.addressLine2 = parts.join(', ');
+  } else {
+    fields.addressLine1 = parts.shift() || '';
+    fields.city = parts.shift() || '';
+    fields.state = parts.shift() || '';
+    fields.country = parts.join(', ');
+  }
+  return fields;
+}
+
+function addressFieldsFromInput(input, fallback = {}) {
+  const hasStructuredFields = ['addressLine1', 'addressLine2', 'city', 'state', 'postalCode', 'country']
+    .some(key => input[key] !== undefined);
+  if (!hasStructuredFields && input.address !== undefined) return parseAddressFields(input.address);
+  return Object.fromEntries(['addressLine1', 'addressLine2', 'city', 'state', 'postalCode', 'country']
+    .map(key => [key, input[key] !== undefined ? String(input[key]).trim() : (fallback[key] || '')]));
+}
+
+function formatAddressFields(fields) {
+  const street = [fields.addressLine1, fields.addressLine2].filter(Boolean).join(', ');
+  return [street, fields.city, fields.state, fields.postalCode, fields.country].filter(Boolean).join(', ');
+}
+
 async function geocodeAddress(address) {
   const parts = address.split(',').map(part => part.trim()).filter(Boolean);
   const candidates = [address];
@@ -179,7 +212,9 @@ app.post('/api/auth/register-school', asyncRoute(async (req, res) => {
       await db.prepare('INSERT INTO schools (id,organization_id,name,code) VALUES (?,?,?,?)').run(schoolId, organizationId, schoolName.trim(), code);
 
       const campusId = id('campus');
-      await db.prepare('INSERT INTO campuses (id,school_id,name,address) VALUES (?,?,?,?)').run(campusId, schoolId, campusName.trim(), campusAddress?.trim() || null);
+      const campusAddressFields = parseAddressFields(campusAddress);
+      await db.prepare('INSERT INTO campuses (id,school_id,name,address,address_line1,address_line2,city,state,postal_code,country) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .run(campusId, schoolId, campusName.trim(), campusAddress?.trim() || null, campusAddressFields.addressLine1 || null, campusAddressFields.addressLine2 || null, campusAddressFields.city || null, campusAddressFields.state || null, campusAddressFields.postalCode || null, campusAddressFields.country || null);
 
       const userId = id('admin');
       await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,role) VALUES (?,?,?,?,'admin')`).run(userId, adminFullName.trim(), email.trim(), passwordHash(password));
@@ -482,8 +517,8 @@ app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin'),
 
 app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   res.json({
-    school: await db.prepare('SELECT id,name,code,address,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
-    campuses: await db.prepare('SELECT id,name,address,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE school_id=? ORDER BY name').all(req.school.id),
+    school: await db.prepare('SELECT id,name,code,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
+    campuses: await db.prepare('SELECT id,name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE school_id=? ORDER BY name').all(req.school.id),
     schoolYears: await db.prepare('SELECT * FROM school_years WHERE school_id=? ORDER BY starts_on DESC').all(req.school.id),
     gradeLevels: await db.prepare('SELECT id,name,sort_order AS "sortOrder",next_grade_level_id AS "nextGradeLevelId" FROM grade_levels ORDER BY sort_order').all(),
     classes: await db.prepare('SELECT id,name,room_name AS "roomName",school_year_id AS "schoolYearId",grade_level_id AS "gradeLevelId",teacher_user_id AS "teacherId",campus_id AS "campusId" FROM classes WHERE school_id=? ORDER BY name').all(req.school.id),
@@ -502,18 +537,19 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'),
       return res.status(400).json({ error: `${label} must be a HH:MM time` });
     }
   }
-  const current = await db.prepare('SELECT name,address,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id);
+  const current = await db.prepare('SELECT name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id);
   if (!current) return res.status(404).json({ error: 'School not found' });
+  const addressFields = addressFieldsFromInput(req.body, current);
   // undefined (field omitted) keeps the existing value; '' explicitly clears it.
   const next = {
     name: name !== undefined && name.trim() ? name.trim() : current.name,
-    address: address !== undefined ? (address.trim() || null) : current.address,
+    address: address !== undefined || req.body.addressLine1 !== undefined ? (formatAddressFields(addressFields) || null) : current.address,
     startTime: startTime !== undefined ? (startTime || null) : current.startTime,
     dismissalTime: dismissalTime !== undefined ? (dismissalTime || null) : current.dismissalTime,
     extendedTime: extendedTime !== undefined ? (extendedTime || null) : current.extendedTime,
   };
-  await db.prepare('UPDATE schools SET name=?, address=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
-    .run(next.name, next.address, next.startTime, next.dismissalTime, next.extendedTime, req.school.id);
+  await db.prepare('UPDATE schools SET name=?, address=?, address_line1=?, address_line2=?, city=?, state=?, postal_code=?, country=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
+    .run(next.name, next.address, addressFields.addressLine1 || null, addressFields.addressLine2 || null, addressFields.city || null, addressFields.state || null, addressFields.postalCode || null, addressFields.country || null, next.startTime, next.dismissalTime, next.extendedTime, req.school.id);
   res.status(204).end();
 }));
 
@@ -529,7 +565,12 @@ const DEFAULT_GEOFENCE_RADIUS_METERS = 150;
 app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
-  if (!address?.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
+  const addressFields = addressFieldsFromInput(req.body);
+  const formattedAddress = formatAddressFields(addressFields);
+  if (!formattedAddress) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
+  if (!addressFields.addressLine1 || !addressFields.city || !addressFields.state || !addressFields.postalCode || !addressFields.country) {
+    return res.status(400).json({ error: 'Street address, city, state, ZIP/postal code, and country are required' });
+  }
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
     if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
       return res.status(400).json({ error: `${label} must be a HH:MM time` });
@@ -540,15 +581,15 @@ app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin')
 
   let coordinates;
   try {
-    coordinates = await geocodeAddress(address.trim());
+    coordinates = await geocodeAddress(formattedAddress);
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
 
   const campusId = id('campus');
   try {
-    await db.prepare('INSERT INTO campuses (id,school_id,name,address,latitude,longitude,geofence_radius,start_time,dismissal_time,extended_time) VALUES (?,?,?,?,?,?,?,?,?,?)')
-      .run(campusId, req.school.id, name.trim(), address.trim(), coordinates.latitude, coordinates.longitude, radius, startTime || null, dismissalTime || null, extendedTime || null);
+    await db.prepare('INSERT INTO campuses (id,school_id,name,address,address_line1,address_line2,city,state,postal_code,country,latitude,longitude,geofence_radius,start_time,dismissal_time,extended_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(campusId, req.school.id, name.trim(), formattedAddress, addressFields.addressLine1 || null, addressFields.addressLine2 || null, addressFields.city || null, addressFields.state || null, addressFields.postalCode || null, addressFields.country || null, coordinates.latitude, coordinates.longitude, radius, startTime || null, dismissalTime || null, extendedTime || null);
     res.status(201).json({ id: campusId, latitude: coordinates.latitude, longitude: coordinates.longitude });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'A location with that name already exists' : error.message });
@@ -566,16 +607,21 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
   if (geofenceRadius !== undefined && geofenceRadius !== null && geofenceRadius !== '' && !(Number(geofenceRadius) > 0)) {
     return res.status(400).json({ error: 'geofenceRadius must be a positive number of meters' });
   }
-  const current = await db.prepare('SELECT name,address,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
+  const current = await db.prepare('SELECT name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
   if (!current) return res.status(404).json({ error: 'Location not found' });
 
   // Re-geocode when the address actually changed, or when it hasn't but
   // still has no coordinates — a location saved before geofencing existed
   // has an address with no lat/long yet, and would otherwise never get
   // one until someone happened to edit the address text itself.
-  const nextAddress = address !== undefined ? address.trim() : current.address;
+  const addressFields = addressFieldsFromInput(req.body, current);
+  const addressWasProvided = address !== undefined || req.body.addressLine1 !== undefined;
+  const nextAddress = addressWasProvided ? formatAddressFields(addressFields) : current.address;
+  if (addressWasProvided && (!addressFields.addressLine1 || !addressFields.city || !addressFields.state || !addressFields.postalCode || !addressFields.country)) {
+    return res.status(400).json({ error: 'Street address, city, state, ZIP/postal code, and country are required' });
+  }
   let coordinates = { latitude: current.latitude, longitude: current.longitude };
-  if (address !== undefined && (nextAddress !== current.address || current.latitude == null || current.longitude == null)) {
+  if (addressWasProvided && (nextAddress !== current.address || current.latitude == null || current.longitude == null)) {
     try {
       coordinates = await geocodeAddress(nextAddress);
     } catch (error) {
@@ -595,8 +641,8 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
     extendedTime: extendedTime !== undefined ? (extendedTime || null) : current.extendedTime,
   };
   try {
-    await db.prepare('UPDATE campuses SET name=?, address=?, latitude=?, longitude=?, geofence_radius=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
-      .run(next.name, next.address, next.latitude, next.longitude, next.geofenceRadius, next.startTime, next.dismissalTime, next.extendedTime, req.params.id);
+    await db.prepare('UPDATE campuses SET name=?, address=?, address_line1=?, address_line2=?, city=?, state=?, postal_code=?, country=?, latitude=?, longitude=?, geofence_radius=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
+      .run(next.name, next.address, addressFields.addressLine1 || null, addressFields.addressLine2 || null, addressFields.city || null, addressFields.state || null, addressFields.postalCode || null, addressFields.country || null, next.latitude, next.longitude, next.geofenceRadius, next.startTime, next.dismissalTime, next.extendedTime, req.params.id);
     res.status(204).end();
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'A location with that name already exists' : error.message });
