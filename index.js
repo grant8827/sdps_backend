@@ -92,6 +92,20 @@ function formatAddressFields(fields) {
   return [street, fields.city, fields.state, fields.postalCode, fields.country].filter(Boolean).join(', ');
 }
 
+// Nominatim frequently can't resolve a street address with a unit/suite
+// marker in it — even one entered as part of a single address line (e.g.
+// legacy data saved before address fields were split out), not just one
+// living in a separate line 2. Requiring a digit after the designator
+// keeps this from misfiring on an ordinary word that merely starts with
+// one, like "Unit" inside "United States".
+function stripUnitMarker(address) {
+  return address
+    .replace(/[,]?\s*(?:#\s*[\w-]*\d[\w-]*|\b(?:suite|ste|unit|apt|apartment|bldg|building|rm|room)\b\.?\s*[\w-]*\d[\w-]*)/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/,\s*,/g, ',')
+    .trim();
+}
+
 async function geocodeAddress(address) {
   const parts = address.split(',').map(part => part.trim()).filter(Boolean);
   const candidates = [address];
@@ -100,6 +114,11 @@ async function geocodeAddress(address) {
   // street address is valid. Keep line 2 in storage, but retry the lookup
   // without it so it cannot prevent a campus from being mapped.
   if (parts.length >= 6) candidates.push([parts[0], ...parts.slice(2)].join(', '));
+  // Catches a unit marker embedded directly in address line 1 (common in
+  // addresses saved before line 2 existed as its own field), which the
+  // line-2-drop candidate above can't reach since there's nothing to drop.
+  const destuited = stripUnitMarker(address);
+  if (destuited && destuited !== address) candidates.push(destuited);
 
   for (const candidate of [...new Set(candidates)]) {
     const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=1&q=${encodeURIComponent(candidate)}`;
