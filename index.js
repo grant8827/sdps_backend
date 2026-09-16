@@ -60,17 +60,32 @@ function localClockTime(timeZone) {
 // in one function so swapping to a paid provider later is a one-place change.
 const NOMINATIM_USER_AGENT = 'school-dropoff-pickup/1.0 (admin-configured campus geocoding)';
 async function geocodeAddress(address) {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(address)}`;
-  let response;
-  try {
-    response = await fetch(url, { headers: { 'User-Agent': NOMINATIM_USER_AGENT } });
-  } catch {
-    throw new Error('Could not verify that address right now. Please try again.');
+  const parts = address.split(',').map(part => part.trim()).filter(Boolean);
+  const candidates = [address];
+  // The clients store line 2 as the second comma-delimited component.
+  // Geocoders frequently fail on suite/building/room text even though the
+  // street address is valid. Keep line 2 in storage, but retry the lookup
+  // without it so it cannot prevent a campus from being mapped.
+  if (parts.length >= 6) candidates.push([parts[0], ...parts.slice(2)].join(', '));
+
+  for (const candidate of [...new Set(candidates)]) {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=1&q=${encodeURIComponent(candidate)}`;
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: { 'User-Agent': NOMINATIM_USER_AGENT, Accept: 'application/json' },
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      continue;
+    }
+    if (!response.ok) continue;
+    const [result] = await response.json();
+    if (result && Number.isFinite(Number(result.lat)) && Number.isFinite(Number(result.lon))) {
+      return { latitude: Number(result.lat), longitude: Number(result.lon) };
+    }
   }
-  if (!response.ok) throw new Error('Could not verify that address right now. Please try again.');
-  const [result] = await response.json();
-  if (!result) throw new Error('That address could not be found. Please check it and try again.');
-  return { latitude: Number(result.lat), longitude: Number(result.lon) };
+  throw new Error('That address could not be mapped. Confirm the street, city, state, ZIP/postal code, and country, then try again.');
 }
 
 // Higher than Express's 100kb default so a student photo (sent as a
