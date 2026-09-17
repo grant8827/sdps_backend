@@ -137,6 +137,32 @@ async function geocodeAddress(address) {
       return { latitude: Number(result.lat), longitude: Number(result.lon) };
     }
   }
+
+  // Nominatim occasionally has no match for a valid U.S. street address.
+  // The U.S. Census geocoder is an independent, key-free authoritative
+  // fallback, so a temporary coverage gap in one provider does not prevent
+  // an administrator from saving the school's geofence location.
+  const censusAddress = stripUnitMarker(candidates.at(-1)).slice(0, 100);
+  try {
+    const params = new URLSearchParams({
+      address: censusAddress,
+      benchmark: 'Public_AR_Current',
+      format: 'json',
+    });
+    const response = await fetch(`https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?${params}`, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (response.ok) {
+      const result = await response.json();
+      const coordinates = result?.result?.addressMatches?.[0]?.coordinates;
+      const latitude = Number(coordinates?.y);
+      const longitude = Number(coordinates?.x);
+      if (Number.isFinite(latitude) && Number.isFinite(longitude)) return { latitude, longitude };
+    }
+  } catch {
+    // The actionable validation error below is shared by both providers.
+  }
   throw new Error('That address could not be mapped. Confirm the street, city, state, ZIP/postal code, and country, then try again.');
 }
 
