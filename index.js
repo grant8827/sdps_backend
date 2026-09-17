@@ -536,6 +536,32 @@ app.get('/api/teacher/students', requireAuth, requireRole('teacher'), asyncRoute
   res.json(rows);
 }));
 
+// Every attendance record on file for the teacher's own class — mirrors
+// /api/me/attendance's shape (per-student record list) so the same kind
+// of month-by-month history view can be built for a teacher's whole
+// class instead of just a parent's own children.
+app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), asyncRoute(async (req, res) => {
+  const rows = await db.prepare(`
+    SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName",
+      ar.date, ar.status, ar.late
+    FROM students s
+    JOIN student_enrollments e ON e.student_id=s.id
+    JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
+    JOIN classes c ON c.id=e.class_id
+    LEFT JOIN attendance_records ar ON ar.student_id=s.id
+    WHERE c.teacher_user_id=? AND s.status!='ARCHIVED'
+    ORDER BY s.last_name, s.first_name, ar.date`).all(req.user.id);
+
+  const byStudent = new Map();
+  for (const row of rows) {
+    if (!byStudent.has(row.studentId)) {
+      byStudent.set(row.studentId, { id: row.studentId, fullName: row.fullName, records: [] });
+    }
+    if (row.date) byStudent.get(row.studentId).records.push({ date: row.date, status: row.status, late: Boolean(row.late) });
+  }
+  res.json([...byStudent.values()]);
+}));
+
 app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   if (!req.query.classId) return res.status(400).json({ error: 'classId is required' });
   const date = req.query.date || todayIso();
