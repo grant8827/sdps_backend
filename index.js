@@ -519,6 +519,23 @@ app.get('/api/teacher/class', requireAuth, requireRole('teacher'), asyncRoute(as
   res.json(myClass || null);
 }));
 
+// Read-only roster for the Class tab — a teacher can see whether a
+// student is active or suspended (an admin-only action, set from
+// Students), but can't change it here. A removed (ARCHIVED) student is
+// filtered out entirely rather than shown with a status, since there's
+// nothing left for a teacher to do about them.
+app.get('/api/teacher/students', requireAuth, requireRole('teacher'), asyncRoute(async (req, res) => {
+  const rows = await db.prepare(`
+    SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl", s.status
+    FROM students s
+    JOIN student_enrollments e ON e.student_id=s.id
+    JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
+    JOIN classes c ON c.id=e.class_id
+    WHERE c.teacher_user_id=? AND s.status!='ARCHIVED'
+    ORDER BY s.last_name,s.first_name`).all(req.user.id);
+  res.json(rows);
+}));
+
 app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   if (!req.query.classId) return res.status(400).json({ error: 'classId is required' });
   const date = req.query.date || todayIso();
