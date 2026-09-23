@@ -300,6 +300,19 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 16,
+    name: 'notices: let an admin target all staff or one staff member, same as it already can for parents',
+    async up(db) {
+      await db.exec(`
+        ALTER TABLE notices DROP CONSTRAINT notices_target_type_check;
+        ALTER TABLE notices ADD CONSTRAINT notices_target_type_check
+          CHECK(target_type IN ('SCHOOL','CLASS','PARENT','ADMIN','STAFF'));
+        ALTER TABLE notices ADD COLUMN IF NOT EXISTS target_staff_user_id TEXT REFERENCES users(id);
+        CREATE INDEX IF NOT EXISTS notices_target_staff_idx ON notices(target_staff_user_id);
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

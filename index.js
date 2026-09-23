@@ -286,16 +286,17 @@ const studentSelect = `
     s.photo_url AS "photoUrl", s.daycare AS daycare,
     s.status, s.pickup_status AS "pickupStatus", e.school_year_id AS "schoolYearId",
     e.grade_level_id AS "gradeLevelId", g.name AS "gradeName", e.class_id AS "classId",
-    c.name AS "className", c.teacher_user_id AS "teacherId", s.school_id AS "schoolId",
+    c.name AS "className", c.teacher_user_id AS "teacherId", tu.full_name AS "teacherName", s.school_id AS "schoolId",
     s.campus_id AS "campusId", sc.name AS "schoolName", cp.name AS "campusName",
     cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius"
   FROM students s LEFT JOIN student_enrollments e ON e.student_id=s.id
   LEFT JOIN school_years y ON y.id=e.school_year_id LEFT JOIN grade_levels g ON g.id=e.grade_level_id
-  LEFT JOIN classes c ON c.id=e.class_id LEFT JOIN schools sc ON sc.id=s.school_id
+  LEFT JOIN classes c ON c.id=e.class_id LEFT JOIN users tu ON tu.id=c.teacher_user_id
+  LEFT JOIN schools sc ON sc.id=s.school_id
   LEFT JOIN campuses cp ON cp.id=s.campus_id`;
 
 app.get('/api/me/students', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
-  const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,sc.name,cp.name,cp.latitude,cp.longitude,cp.geofence_radius ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
+  const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,tu.full_name,sc.name,cp.name,cp.latitude,cp.longitude,cp.geofence_radius ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
   res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare) })));
 }));
 
@@ -416,7 +417,7 @@ app.get('/api/teacher/queue', requireAuth, requireRole('teacher'), asyncRoute(as
   res.json(await db.prepare(`${queueSelect} WHERE qi.status='PENDING' AND qi.teacher_user_id=? ORDER BY qi.requested_at ASC`).all(req.user.id));
 }));
 
-app.get('/api/admin/queue', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/queue', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json(await db.prepare(`${queueSelect} WHERE qi.status='PENDING' AND qi.school_id=? ORDER BY qi.requested_at ASC`).all(req.school.id));
 }));
 
@@ -493,7 +494,8 @@ const todayIso = () => new Date().toISOString().slice(0, 10);
 const attendanceSelect = `
   SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl",
     e.class_id AS "classId", c.name AS "className",
-    COALESCE(ar.status, CASE WHEN EXTRACT(DOW FROM ?::date) IN (0,6) THEN 'WEEKEND' ELSE 'UNMARKED' END) AS status
+    COALESCE(ar.status, CASE WHEN EXTRACT(DOW FROM ?::date) IN (0,6) THEN 'WEEKEND' ELSE 'UNMARKED' END) AS status,
+    COALESCE(ar.late, 0) AS late
   FROM students s
   JOIN student_enrollments e ON e.student_id=s.id
   JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
@@ -503,7 +505,8 @@ const attendanceSelect = `
 
 app.get('/api/teacher/attendance', requireAuth, requireRole('teacher'), asyncRoute(async (req, res) => {
   const date = req.query.date || todayIso();
-  res.json(await db.prepare(`${attendanceSelect} AND c.teacher_user_id=? ORDER BY s.last_name,s.first_name`).all(date, date, req.user.id));
+  const rows = await db.prepare(`${attendanceSelect} AND c.teacher_user_id=? ORDER BY s.last_name,s.first_name`).all(date, date, req.user.id);
+  res.json(rows.map(row => ({ ...row, late: Boolean(row.late) })));
 }));
 
 // The classroom a teacher was assigned to (admin sets this from the
@@ -562,10 +565,32 @@ app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), 
   res.json([...byStudent.values()]);
 }));
 
-app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   if (!req.query.classId) return res.status(400).json({ error: 'classId is required' });
   const date = req.query.date || todayIso();
-  res.json(await db.prepare(`${attendanceSelect} AND s.school_id=? AND e.class_id=? ORDER BY s.last_name,s.first_name`).all(date, date, req.school.id, req.query.classId));
+  const rows = await db.prepare(`${attendanceSelect} AND s.school_id=? AND e.class_id=? ORDER BY s.last_name,s.first_name`).all(date, date, req.school.id, req.query.classId);
+  res.json(rows.map(row => ({ ...row, late: Boolean(row.late) })));
+}));
+
+// School-wide counts for the Students > Attendance analytics strip —
+// every active student's status for the day, across every classroom,
+// not just whichever one classroom happens to be selected below it.
+// "Late" is its own tile even though it's a subset of Present (a
+// PRESENT record whose drop-off landed after the school's start time,
+// see the late computation on the queue-approval insert above) — that
+// overlap is intentional, same as most attendance dashboards.
+app.get('/api/admin/attendance/summary', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  const date = req.query.date || todayIso();
+  const rows = await db.prepare(`${attendanceSelect} AND s.school_id=?`).all(date, date, req.school.id);
+  const summary = { present: 0, absent: 0, sick: 0, late: 0, unmarked: 0, total: rows.length };
+  for (const row of rows) {
+    if (row.status === 'PRESENT') summary.present++;
+    else if (row.status === 'ABSENT') summary.absent++;
+    else if (row.status === 'SICK') summary.sick++;
+    else if (row.status === 'UNMARKED') summary.unmarked++;
+    if (row.late) summary.late++;
+  }
+  res.json(summary);
 }));
 
 // A teacher may mark attendance only for their own class; an admin may
@@ -595,7 +620,7 @@ app.post('/api/attendance', requireAuth, asyncRoute(async (req, res) => {
   res.status(204).end();
 }));
 
-app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const totalStudents = (await db.prepare(`SELECT COUNT(*) AS c FROM students WHERE school_id=? AND status='ACTIVE'`).get(req.school.id)).c;
   const activeTeachers = (await db.prepare(`SELECT COUNT(*) AS c FROM memberships WHERE school_id=? AND role='teacher' AND status='ACTIVE'`).get(req.school.id)).c;
   const presentToday = (await db.prepare(`SELECT COUNT(*) AS c FROM students WHERE school_id=? AND status='ACTIVE' AND pickup_status='PRESENT'`).get(req.school.id)).c;
@@ -603,7 +628,7 @@ app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin'),
   res.json({ totalStudents, activeTeachers, presentToday, pendingRequests });
 }));
 
-app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json({
     school: await db.prepare('SELECT id,name,code,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
     campuses: await db.prepare('SELECT id,name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE school_id=? ORDER BY name').all(req.school.id),
@@ -618,7 +643,7 @@ app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin'), as
 // lexicographic time comparison the late-arrival check below relies on.
 const isValidClockTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 
-app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime } = req.body;
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
     if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
@@ -650,7 +675,7 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'),
 // admin to pick a number up front; editable afterward in School Setup.
 const DEFAULT_GEOFENCE_RADIUS_METERS = 150;
 
-app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
   const addressFields = addressFieldsFromInput(req.body);
@@ -684,7 +709,7 @@ app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin')
   }
 }));
 
-app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (address !== undefined && !address.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
@@ -737,7 +762,7 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
   }
 }));
 
-app.get('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json(await db.prepare(`
     SELECT c.id, c.name, c.room_name AS "roomName", c.school_year_id AS "schoolYearId", y.name AS "schoolYearName",
       c.grade_level_id AS "gradeLevelId", g.name AS "gradeName", c.campus_id AS "campusId",
@@ -751,7 +776,7 @@ app.get('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'), 
     ORDER BY y.starts_on DESC, g.sort_order, c.name`).all(req.school.id));
 }));
 
-app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { name, gradeLevelId, roomName, schoolYearId, campusId } = req.body;
   if (!name?.trim() || !gradeLevelId || !schoolYearId) return res.status(400).json({ error: 'Class name, grade, and school year are required' });
   const year = await db.prepare('SELECT id FROM school_years WHERE id=? AND school_id=?').get(schoolYearId, req.school.id);
@@ -770,7 +795,7 @@ app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'),
   }
 }));
 
-app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
     SELECT u.id, u.full_name AS "fullName", u.email, u.photo_url AS "photoUrl", m.status,
       c.id AS "classId", c.name AS "className"
@@ -782,7 +807,7 @@ app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin'),
   res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
 }));
 
-app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { fullName, email, password, photoDataUrl, classId } = req.body;
   if (!fullName?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
@@ -819,7 +844,7 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin')
 // Edit an existing teacher: name, photo, and/or which classroom they're
 // assigned to (passing classId: null unassigns them; omitting it leaves
 // the assignment as-is). No password reset here — out of scope for now.
-app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const membership = await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role='teacher'`).get(req.params.id, req.school.id);
   if (!membership) return res.status(404).json({ error: 'Teacher not found in this school' });
   const { fullName, photoDataUrl, classId } = req.body;
@@ -842,7 +867,90 @@ app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_ad
   res.status(204).end();
 }));
 
-app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+// General staff directory — teachers, admins, and front-desk/office
+// staff together (unlike /api/admin/teachers above, which stays
+// teacher-only since it also backs the classroom-teacher pickers
+// elsewhere). 'admin' and 'front_desk' both get a users.role='admin'
+// login (routed to the admin dashboard by the frontend); 'front_desk'
+// is tagged with the 'staff' membership role so it's a distinct entry
+// in the Staff list even though — per requireSchoolAccess above — it
+// carries the exact same route access as school_admin.
+const STAFF_ROLES = {
+  teacher: { userRole: 'teacher', membershipRole: 'teacher' },
+  admin: { userRole: 'admin', membershipRole: 'school_admin' },
+  front_desk: { userRole: 'admin', membershipRole: 'staff' },
+};
+
+app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  const rows = await db.prepare(`
+    SELECT u.id, u.full_name AS "fullName", u.email, u.photo_url AS "photoUrl", m.status, m.role,
+      c.id AS "classId", c.name AS "className"
+    FROM memberships m
+    JOIN users u ON u.id=m.user_id
+    LEFT JOIN classes c ON c.teacher_user_id=u.id AND c.school_id=?
+    WHERE m.school_id=? AND m.role IN ('teacher','school_admin','staff') AND m.status != 'ARCHIVED'
+    ORDER BY u.full_name`).all(req.school.id, req.school.id);
+  res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
+}));
+
+app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  const { fullName, email, password, photoDataUrl, classId, role } = req.body;
+  const roleConfig = STAFF_ROLES[role];
+  if (!roleConfig) return res.status(400).json({ error: 'role must be one of teacher, admin, front_desk' });
+  if (!fullName?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  let photoUrl;
+  try {
+    photoUrl = normalizePhotoDataUrl(photoDataUrl); // optional — photo is never required
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  let assignedClass = null;
+  if (role === 'teacher' && classId) {
+    assignedClass = await db.prepare('SELECT id, campus_id AS "campusId" FROM classes WHERE id=? AND school_id=?').get(classId, req.school.id);
+    if (!assignedClass) return res.status(400).json({ error: 'That classroom does not belong to this school' });
+  }
+  try {
+    const userId = await withTransaction(async () => {
+      if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
+        throw new Error('An account with this email already exists.');
+      }
+      const userId = id('staff');
+      await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,photo_url,role) VALUES (?,?,?,?,?,?)`)
+        .run(userId, fullName.trim(), email.trim(), passwordHash(password), photoUrl, roleConfig.userRole);
+      await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?,?)`)
+        .run(id('membership'), userId, req.school.id, assignedClass?.campusId || null, roleConfig.membershipRole);
+      if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
+      return userId;
+    });
+    res.status(201).json({ id: userId });
+  } catch (error) {
+    res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
+  }
+}));
+
+// Suspend blocks admin-route access (requireSchoolAccess only honors an
+// ACTIVE membership) without touching their login itself; delete
+// archives the membership and, for a teacher, frees up their classroom.
+// Either way, an admin can't take either action on their own account —
+// that would risk locking every admin out of the school at once.
+app.patch('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot change your own status' });
+  const status = req.body.active ? 'ACTIVE' : 'SUSPENDED';
+  const result = await db.prepare(`UPDATE memberships SET status=? WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff')`).run(status, req.params.id, req.school.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Staff member not found in this school' });
+  res.status(204).end();
+}));
+
+app.delete('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
+  const result = await db.prepare(`UPDATE memberships SET status='ARCHIVED' WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff')`).run(req.params.id, req.school.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Staff member not found in this school' });
+  await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=?`).run(req.params.id, req.school.id);
+  res.status(204).end();
+}));
+
+app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const active = await db.prepare(`${studentSelect} WHERE s.school_id=? AND y.status='ACTIVE' ORDER BY s.last_name,s.first_name`).all(req.school.id);
   const guardianQuery = db.prepare(`SELECT gu.id,u.full_name AS "fullName",u.email,sg.relationship,sg.can_pick_up AS "canPickUp",sg.is_primary AS "isPrimary" FROM student_guardians sg JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id WHERE sg.student_id=?`);
   // `status` mirrors pickupStatus everywhere else this shape is used (the
@@ -852,7 +960,7 @@ app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin'),
   res.json(students);
 }));
 
-app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { firstName, lastName, dateOfBirth, studentNumber, photoDataUrl, schoolYearId, gradeLevelId, classId, daycare, guardian } = req.body;
   if (!firstName?.trim() || !lastName?.trim() || !schoolYearId || !gradeLevelId) return res.status(400).json({ error: 'Name, school year, and grade are required' });
   if (!classId) return res.status(400).json({ error: 'Select a class so pickup requests reach a teacher' });
@@ -897,7 +1005,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
   }
 }));
 
-app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { guardianId, relationship = 'Guardian', canPickUp = true, canManage = true } = req.body;
   try {
     const allowed = await db.prepare(`SELECT 1 FROM students s JOIN guardians gu ON gu.id=? JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.status='ACTIVE' WHERE s.id=? AND s.school_id=?`).get(guardianId, req.params.studentId, req.school.id);
@@ -910,27 +1018,27 @@ app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolA
 // Suspend blocks login (auth.js's login query requires active=1); delete
 // removes the user outright and cascades to their guardian row and any
 // student_guardians links (both declared ON DELETE CASCADE).
-app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const status = req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
   const result = await db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
   res.status(204).end();
 }));
 
-app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const result = await db.prepare(`UPDATE students SET status='ARCHIVED' WHERE id=? AND school_id=?`).run(req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
   res.status(204).end();
 }));
 
-app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
-  const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.full_name AS "fullName", u.email, u.phone, m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
+app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.id AS "userId", u.full_name AS "fullName", u.email, u.phone, m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
   const children = db.prepare(`SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName" FROM student_guardians sg JOIN students s ON s.id=sg.student_id WHERE sg.guardian_id=? AND s.school_id=?`);
   const result = await Promise.all(guardians.map(async g => ({ ...g, active: g.status === 'ACTIVE', children: await children.all(g.id, req.school.id) })));
   res.json(result);
 }));
 
-app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { fullName, email, phone, temporaryPassword } = req.body;
   if (!fullName?.trim() || !email?.trim() || !temporaryPassword) return res.status(400).json({ error: 'Name, email, and temporary password are required' });
   try {
@@ -955,7 +1063,7 @@ app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'
   }
 }));
 
-app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const guardian = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(req.params.id);
   if (!guardian) return res.status(404).json({ error: 'Guardian not found' });
   const result = await db.prepare(`UPDATE memberships SET status=? WHERE user_id=? AND school_id=? AND role='parent'`).run(req.body.active ? 'ACTIVE' : 'SUSPENDED', guardian.user_id, req.school.id);
@@ -963,7 +1071,7 @@ app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_a
   res.status(204).end();
 }));
 
-app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const guardian = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(req.params.id);
   if (!guardian) return res.status(404).json({ error: 'Guardian not found' });
   const result = await db.prepare(`UPDATE memberships SET status='ARCHIVED' WHERE user_id=? AND school_id=? AND role='parent'`).run(guardian.user_id, req.school.id);
@@ -972,7 +1080,7 @@ app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_
   res.status(204).end();
 }));
 
-app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const from = req.query.from; const to = req.query.to;
   const rows = await db.prepare(`${studentSelect} WHERE e.school_year_id=? AND s.school_id=? AND e.status='ENROLLED' ORDER BY s.last_name,s.first_name`).all(from, req.school.id);
   const next = db.prepare('SELECT id,name FROM grade_levels WHERE id=(SELECT next_grade_level_id FROM grade_levels WHERE id=?)');
@@ -981,7 +1089,7 @@ app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('schoo
   res.json(result);
 }));
 
-app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { fromSchoolYearId, toSchoolYearId, overrides = {} } = req.body;
   try {
     const promoted = await withTransaction(async () => {
@@ -1012,7 +1120,7 @@ app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin
 // still only gets one enrollment per school year, same as any other
 // enrollment path), unlike the whole-cohort run above which is a
 // one-shot per (fromYear,toYear) pair.
-app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { fromSchoolYearId, toSchoolYearId, fromGradeLevelId, toGradeLevelId, teacherUserId } = req.body;
   if (!fromSchoolYearId || !toSchoolYearId || !fromGradeLevelId || !toGradeLevelId) {
     return res.status(400).json({ error: 'From/To school year and From/To grade are required' });
@@ -1053,7 +1161,7 @@ app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('sch
 // grade and teacher aren't separate inputs, they're just whatever the
 // destination class already is, so there's no way to pick a grade that
 // doesn't match the teacher you picked.
-app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const { fromClassId, toClassId, teacherUserId } = req.body;
   if (!fromClassId || !toClassId) return res.status(400).json({ error: 'fromClassId and toClassId are required' });
   const fromClass = await db.prepare('SELECT id, school_year_id AS "schoolYearId" FROM classes WHERE id=? AND school_id=?').get(fromClassId, req.school.id);
@@ -1094,6 +1202,24 @@ app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('sch
   }
 }));
 
+// Flips a PLANNING year to ACTIVE (and closes whatever year was ACTIVE
+// before it) — the step that actually makes a finished round of
+// promotions visible to parents and teachers, who only ever see data
+// tied to the ACTIVE year. Kept as its own explicit action, separate
+// from promoting individual classes, so an admin can promote classes
+// one grade at a time without the school's current year flipping out
+// from under the classes not promoted yet.
+app.post('/api/admin/school-years/:id/activate', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  const year = await db.prepare('SELECT id, status FROM school_years WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
+  if (!year) return res.status(404).json({ error: 'School year not found' });
+  if (year.status !== 'PLANNING') return res.status(400).json({ error: 'Only a year that is still in planning can be activated' });
+  await withTransaction(async () => {
+    await db.prepare(`UPDATE school_years SET status='CLOSED' WHERE school_id=? AND status='ACTIVE'`).run(req.school.id);
+    await db.prepare(`UPDATE school_years SET status='ACTIVE' WHERE id=?`).run(req.params.id);
+  });
+  res.status(204).end();
+}));
+
 // Real notices — a teacher can message their whole class or one
 // specific parent (real name, from the actual guardians on file), an
 // admin can broadcast to the whole school. Replaces the old in-memory
@@ -1114,7 +1240,7 @@ app.get('/api/teacher/parents', requireAuth, requireRole('teacher'), asyncRoute(
 }));
 
 app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
-  const { title, body, targetType, targetParentUserId } = req.body;
+  const { title, body, targetType, targetParentUserId, targetStaffUserId } = req.body;
   if (!title?.trim() || !body?.trim()) return res.status(400).json({ error: 'title and body are required' });
 
   if (req.user.role === 'teacher') {
@@ -1133,6 +1259,9 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
       if (!isMyClassParent) return res.status(403).json({ error: 'That parent is not linked to a student in your class.' });
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
         .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'PARENT', targetParentUserId);
+    } else if (targetType === 'ADMIN') {
+      await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'ADMIN');
     } else {
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_teacher_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
         .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'CLASS', req.user.id);
@@ -1140,12 +1269,85 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
     return res.status(204).end();
   }
 
-  const isSchoolAdmin = (await getMemberships(req.user.id)).some(m => ['school_admin', 'platform_super_admin'].includes(m.role));
-  if (!isSchoolAdmin) return res.status(403).json({ error: 'Only a teacher or school admin can send notices.' });
-  const membership = (await getMemberships(req.user.id)).find(m => ['school_admin', 'platform_super_admin'].includes(m.role));
-  await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'SCHOOL');
+  if (req.user.role === 'parent') {
+    const membership = (await getMemberships(req.user.id)).find(m => m.role === 'parent');
+    if (!membership) return res.status(403).json({ error: 'No active parent membership' });
+    if (targetType === 'TEACHER') {
+      if (!targetStaffUserId) return res.status(400).json({ error: 'targetStaffUserId is required' });
+      const isMyChildsTeacher = await db.prepare(`
+        SELECT 1 FROM classes c
+        JOIN student_enrollments e ON e.class_id=c.id
+        JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
+        JOIN students s ON s.id=e.student_id AND s.status='ACTIVE'
+        JOIN student_guardians sg ON sg.student_id=s.id
+        JOIN guardians gu ON gu.id=sg.guardian_id
+        WHERE gu.user_id=? AND c.teacher_user_id=?`).get(req.user.id, targetStaffUserId);
+      if (!isMyChildsTeacher) return res.status(403).json({ error: "That teacher doesn't teach one of your children." });
+      // Lands in the same STAFF inbox a teacher already checks — no
+      // separate parent-to-teacher mailbox needed, and 'staff' here
+      // means "this one teacher", never "all staff", since a parent
+      // never gets to broadcast.
+      await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_staff_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'STAFF', targetStaffUserId);
+    } else {
+      // Otherwise: a note to the school office — there's no audience
+      // choice to make here, every other targetType value means ADMIN.
+      await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'ADMIN');
+    }
+    return res.status(204).end();
+  }
+
+  const adminMemberships = await getMemberships(req.user.id);
+  const membership = adminMemberships.find(m => ['school_admin', 'platform_super_admin', 'staff'].includes(m.role));
+  if (!membership) return res.status(403).json({ error: 'Only a teacher, admin, or staff member can send notices.' });
+
+  if (targetType === 'PARENT') {
+    if (!targetParentUserId) return res.status(400).json({ error: 'targetParentUserId is required' });
+    const isSchoolParent = await db.prepare(`
+      SELECT 1 FROM guardians gu JOIN memberships m ON m.user_id=gu.user_id
+      WHERE gu.user_id=? AND m.school_id=? AND m.role='parent' AND m.status='ACTIVE'`).get(targetParentUserId, membership.schoolId);
+    if (!isSchoolParent) return res.status(400).json({ error: 'That parent does not belong to this school' });
+    await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'PARENT', targetParentUserId);
+  } else if (targetType === 'STAFF') {
+    let staffUserId = null;
+    if (targetStaffUserId) {
+      const isSchoolStaff = await db.prepare(`
+        SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff') AND status='ACTIVE'`).get(targetStaffUserId, membership.schoolId);
+      if (!isSchoolStaff) return res.status(400).json({ error: 'That staff member does not belong to this school' });
+      staffUserId = targetStaffUserId;
+    }
+    await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_staff_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'STAFF', staffUserId);
+  } else {
+    await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'SCHOOL');
+  }
   res.status(204).end();
+}));
+
+// Staff inbox — every teacher/admin/front-desk membership can see
+// notices addressed to "All Staff" (target_staff_user_id IS NULL) or to
+// them specifically. Shared by the admin dashboard's Notices tab and
+// the teacher app's Notices tab, same as /me/notices is shared by every
+// parent screen. Admin-side viewers (school_admin/staff) additionally
+// see ADMIN-targeted notices here — messages a parent or teacher sent
+// to the school office, plus the existing co-guardian-invite alerts —
+// so a teacher's own inbox isn't cluttered with messages meant for the
+// office, but the office sees everything addressed to it in one place.
+app.get('/api/staff/notices', requireAuth, requireSchoolAccess('school_admin', 'staff', 'teacher'), asyncRoute(async (req, res) => {
+  const isAdminSide = ['school_admin', 'staff', 'platform_super_admin'].includes(req.membership.role);
+  res.json(await db.prepare(`
+    SELECT n.id, n.title, n.body, n.sender_name AS "senderName", n.sender_role AS "senderRole", n.created_at AS "createdAt",
+      CASE WHEN nr.user_id IS NULL THEN 0 ELSE 1 END AS read
+    FROM notices n
+    LEFT JOIN notice_reads nr ON nr.notice_id=n.id AND nr.user_id=?
+    WHERE n.school_id=? AND (
+      (n.target_type='STAFF' AND (n.target_staff_user_id IS NULL OR n.target_staff_user_id=?))
+      OR (n.target_type='ADMIN' AND ?)
+    )
+    ORDER BY n.created_at DESC`).all(req.user.id, req.school.id, req.user.id, isAdminSide));
 }));
 
 app.get('/api/me/notices', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
@@ -1184,7 +1386,7 @@ app.post('/api/notices/:id/read', requireAuth, asyncRoute(async (req, res) => {
 // surprised by a new adult with pickup access they never approved —
 // nothing blocks the invite (this app has no in-app approval flow
 // yet), but it's not silent either.
-app.get('/api/admin/notices', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+app.get('/api/admin/notices', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json(await db.prepare(`
     SELECT n.id, n.title, n.body, n.sender_name AS "senderName", n.sender_role AS "senderRole", n.created_at AS "createdAt",
       CASE WHEN nr.user_id IS NULL THEN 0 ELSE 1 END AS read
