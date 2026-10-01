@@ -313,6 +313,159 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 17,
+    name: 'audit_logs: append-only record of sensitive actions (views, pickup authorization, queue, record changes)',
+    async up(db) {
+      // No foreign keys on purpose: an entry must outlive the user,
+      // student or school it mentions, so names are copied in at write
+      // time. The trigger makes the table append-only at the database
+      // level — even a bug (or an attacker) going through the app can't
+      // rewrite or erase history; only a deliberate migration that drops
+      // the trigger could.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+          id TEXT PRIMARY KEY,
+          school_id TEXT,
+          actor_user_id TEXT,
+          actor_name TEXT,
+          actor_role TEXT,
+          action TEXT NOT NULL,
+          target_type TEXT,
+          target_id TEXT,
+          target_label TEXT,
+          details TEXT,
+          ip_address TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS audit_logs_school_created_idx ON audit_logs(school_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_logs_target_idx ON audit_logs(target_type, target_id);
+        CREATE OR REPLACE FUNCTION audit_logs_append_only() RETURNS trigger AS $$
+        BEGIN
+          RAISE EXCEPTION 'audit_logs is append-only';
+        END;
+        $$ LANGUAGE plpgsql;
+        DROP TRIGGER IF EXISTS audit_logs_no_change ON audit_logs;
+        CREATE TRIGGER audit_logs_no_change BEFORE UPDATE OR DELETE ON audit_logs
+          FOR EACH ROW EXECUTE FUNCTION audit_logs_append_only();
+      `);
+    },
+  },
+  {
+    version: 18,
+    name: 'guardian_requests: a parent-added adult waits for admin approval before getting any access to a child',
+    async up(db) {
+      // Kept separate from student_guardians on purpose: nothing that
+      // reads student_guardians (pickup checks, parent screens, teacher
+      // messaging, ...) can ever see a pending adult, because they only
+      // get a student_guardians row once approved. One parent submission
+      // is one batch_id (one row per child it covers), approved or
+      // rejected together. Rows are kept after a decision as the history
+      // of who asked, who decided, and when.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS guardian_requests (
+          id TEXT PRIMARY KEY,
+          batch_id TEXT NOT NULL,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          student_id TEXT NOT NULL REFERENCES students(id),
+          guardian_id TEXT NOT NULL REFERENCES guardians(id) ON DELETE CASCADE,
+          relationship TEXT NOT NULL,
+          can_pick_up INTEGER NOT NULL DEFAULT 1,
+          can_manage INTEGER NOT NULL DEFAULT 0,
+          requested_by_user_id TEXT NOT NULL REFERENCES users(id),
+          requested_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING','APPROVED','REJECTED')),
+          decided_by_user_id TEXT REFERENCES users(id),
+          decided_at TEXT,
+          decision_note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS guardian_requests_school_status_idx ON guardian_requests(school_id, status);
+        CREATE INDEX IF NOT EXISTS guardian_requests_batch_idx ON guardian_requests(batch_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS guardian_requests_one_pending_idx ON guardian_requests(student_id, guardian_id) WHERE status='PENDING';
+      `);
+    },
+  },  {
+    version: 19,
+    name: 'queue_items: one-time pickup verification code the teacher must enter to release a child',
+    async up(db) {
+      // pickup_code is cleared as soon as the request is decided, so a
+      // code only ever exists while its pickup is pending.
+      // verification_method records how a pickup was released: CODE, or
+      // ADMIN_OVERRIDE (an admin checked identity another way and gave
+      // override_reason).
+      await db.exec(`
+        ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS pickup_code TEXT;
+        ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS pickup_code_attempts INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS verification_method TEXT;
+        ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS override_reason TEXT;
+      `);
+    },
+  },  {
+    version: 20,
+    name: 'two-step verification: authenticator-app secrets, recovery codes and sign-in challenges',
+    async up(db) {
+      // mfa_secret / mfa_pending_secret are AES-GCM encrypted (mfa.js).
+      // mfa_pending_secret holds a secret during setup until the user
+      // proves their app works by entering a code from it.
+      // mfa_last_step stops a code from being used twice.
+      // An mfa_challenges row is the half-finished sign-in between "password
+      // was right" and "code was right" — stored hashed, short-lived, and
+      // only good for a few wrong codes before the password is needed again.
+      await db.exec(`
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_pending_secret TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled_at TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_last_step BIGINT;
+        CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          code_hash TEXT NOT NULL,
+          used_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS mfa_recovery_codes_user_idx ON mfa_recovery_codes(user_id);
+        CREATE TABLE IF NOT EXISTS mfa_challenges (
+          token_hash TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          purpose TEXT NOT NULL CHECK(purpose IN ('VERIFY','SETUP')),
+          expires_at BIGINT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0
+        );
+      `);
+    },
+  },  {
+    version: 21,
+    name: 'data retention: when a student was removed, and per-school retention settings',
+    async up(db) {
+      // archived_at starts the retention clock for a removed student;
+      // students removed before this existed start theirs now. NULL
+      // retention settings mean "keep until deleted by hand".
+      await db.exec(`
+        ALTER TABLE students ADD COLUMN IF NOT EXISTS archived_at TEXT;
+        UPDATE students SET archived_at=to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS') WHERE status='ARCHIVED' AND archived_at IS NULL;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS removed_student_retention_days INTEGER;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS queue_history_retention_days INTEGER;
+      `);
+    },
+  },  {
+    version: 22,
+    name: 'district admins: a person who administers every school in a district (organization)',
+    async up(db) {
+      // A district is an organizations row; its schools are the schools
+      // with that organization_id. A district admin gets school-admin
+      // rights in each ACTIVE school of the district (tenant.js expands
+      // this into one membership per school) and nothing outside it.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS district_memberships (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          organization_id TEXT NOT NULL REFERENCES organizations(id),
+          status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','SUSPENDED')),
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          UNIQUE(user_id, organization_id)
+        );
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

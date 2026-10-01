@@ -1,6 +1,6 @@
 import pg from 'pg';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { randomUUID, scryptSync } from 'node:crypto';
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { runMigrations } from './migrations.js';
 
 const { Pool, types } = pg;
@@ -81,7 +81,27 @@ export async function withTransaction(fn) {
 export const isUniqueViolation = error => error?.code === '23505';
 
 export const id = prefix => `${prefix}-${randomUUID()}`;
-export const passwordHash = password => scryptSync(password, 'school-dropoff-local-v1', 64).toString('hex');
+
+// Passwords are stored as `scrypt$<salt hex>$<hash hex>` with a random
+// salt per user, so two users with the same password get different
+// hashes and a leaked table can't be attacked with one precomputed list.
+// Hashes from before this change are bare hex made with one fixed salt
+// shared by everyone; verifyPassword still accepts those and reports
+// `needsRehash` so login can quietly upgrade them to the salted format.
+const LEGACY_SALT = 'school-dropoff-local-v1';
+export const passwordHash = password => {
+  const salt = randomBytes(16).toString('hex');
+  return `scrypt$${salt}$${scryptSync(password, salt, 64).toString('hex')}`;
+};
+export function verifyPassword(password, stored) {
+  const [salt, expectedHex, needsRehash] = stored?.startsWith('scrypt$')
+    ? [...stored.split('$').slice(1, 3), false]
+    : [LEGACY_SALT, stored, true];
+  const expected = Buffer.from(expectedHex || '', 'hex');
+  const supplied = scryptSync(password, salt, 64);
+  const ok = expected.length === supplied.length && timingSafeEqual(expected, supplied);
+  return { ok, needsRehash: ok && needsRehash };
+}
 
 // Timestamp default that reproduces SQLite's CURRENT_TIMESTAMP string
 // shape exactly ('YYYY-MM-DD HH:MM:SS', UTC) instead of switching to
@@ -140,7 +160,26 @@ await pool.query(`
   );
 `);
 
-async function seed() {
+// Grade levels are shared reference data every school uses — always present.
+async function seedReferenceData() {
+  const grades = ['Pre-K', 'Kindergarten', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+  const addGrade = db.prepare('INSERT INTO grade_levels (id,name,sort_order) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING');
+  for (const [index, name] of grades.entries()) await addGrade.run(`grade-${index}`, name, index);
+  for (const index of grades.keys()) {
+    if (index < grades.length - 1) await db.prepare('UPDATE grade_levels SET next_grade_level_id=? WHERE id=?').run(`grade-${index + 1}`, `grade-${index}`);
+  }
+}
+
+// Demo people, classes and students for the "Demo School" — all with the
+// password "password". Only created when SEED_DEMO_DATA=true (local
+// development, tests, a sales-demo server); a real deployment must leave
+// it off. When it's off, any demo accounts already in the database (e.g.
+// created by an earlier version that always seeded) are deactivated so
+// nobody can sign in with them.
+const DEMO_USER_IDS = ['admin-1', 'teacher-1', 'teacher-2', 'parent-1', 'parent-2'];
+export const demoDataEnabled = () => process.env.SEED_DEMO_DATA === 'true';
+
+async function seedDemoData() {
   const addUser = db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,role) VALUES (?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING`);
   await addUser.run('admin-1', 'Alex Admin', 'admin@school.test', null, passwordHash('password'), 'admin');
   await addUser.run('teacher-1', 'Taylor Teacher', 'teacher@school.test', null, passwordHash('password'), 'teacher');
@@ -150,12 +189,6 @@ async function seed() {
   await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?) ON CONFLICT (id) DO NOTHING').run('guardian-1', 'parent-1');
   await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?) ON CONFLICT (id) DO NOTHING').run('guardian-2', 'parent-2');
 
-  const grades = ['Pre-K', 'Kindergarten', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
-  const addGrade = db.prepare('INSERT INTO grade_levels (id,name,sort_order) VALUES (?,?,?) ON CONFLICT (id) DO NOTHING');
-  for (const [index, name] of grades.entries()) await addGrade.run(`grade-${index}`, name, index);
-  for (const index of grades.keys()) {
-    if (index < grades.length - 1) await db.prepare('UPDATE grade_levels SET next_grade_level_id=? WHERE id=?').run(`grade-${index + 1}`, `grade-${index}`);
-  }
   await db.prepare(`INSERT INTO school_years (id,name,starts_on,ends_on,status) VALUES ('year-current','2026-2027','2026-08-01','2027-06-30','ACTIVE') ON CONFLICT (id) DO NOTHING`).run();
   await db.prepare(`INSERT INTO school_years (id,name,starts_on,ends_on,status) VALUES ('year-next','2027-2028','2027-08-01','2028-06-30','PLANNING') ON CONFLICT (id) DO NOTHING`).run();
   await db.prepare(`INSERT INTO classes (id,name,room_name,school_year_id,grade_level_id,teacher_user_id) VALUES ('class-1','Grade 1 - Room 12','Room 12','year-current','grade-2','teacher-1') ON CONFLICT (id) DO NOTHING`).run();
@@ -175,5 +208,15 @@ async function seed() {
   await enroll.run('enrollment-3', 'child-3', 'year-current', 'grade-3', 'class-2');
 }
 
-await seed();
+async function deactivateDemoAccounts() {
+  const result = await pool.query(`UPDATE users SET active=0 WHERE id = ANY($1) AND email LIKE '%@school.test' AND active=1`, [DEMO_USER_IDS]);
+  if (result.rowCount) {
+    await pool.query(`DELETE FROM sessions WHERE user_id = ANY($1)`, [DEMO_USER_IDS]);
+    console.warn(`Deactivated ${result.rowCount} demo account(s) (@school.test, password "password") because SEED_DEMO_DATA is not "true".`);
+  }
+}
+
+await seedReferenceData();
+if (demoDataEnabled()) await seedDemoData();
 await runMigrations(db, withTransaction);
+if (!demoDataEnabled()) await deactivateDemoAccounts();

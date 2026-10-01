@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env index.js",
     "dev": "node --env-file-if-exists=.env node_modules/nodemon/bin/nodemon.js index.js",
-    "test": "node --env-file-if-exists=.env --test --test-isolation=none"
+    "test": "node --env-file-if-exists=.env --test --test-isolation=none",
+    "district": "node --env-file-if-exists=.env scripts/district.js"
   },
   "dependencies": {
     "express": "^4.18.2",

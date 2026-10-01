@@ -1,17 +1,53 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { timingSafeEqual } from 'node:crypto';
-import { db, id, passwordHash, isUniqueViolation, withTransaction } from './db.js';
-import { login, logout, requireAuth, requireRole } from './auth.js';
-import { getMemberships, requireSchoolAccess } from './tenant.js';
+import { db, id, passwordHash, verifyPassword, isUniqueViolation, withTransaction } from './db.js';
+import { createSession, endAllSessions, endChallenge, failChallenge, findChallenge, login, logout, mfaRequiredFor, requireAuth, requireRole } from './auth.js';
+import { decryptSecret, encryptSecret, hashRecoveryCode, looksLikeRecoveryCode, newRecoveryCodes, newTotpSecret, otpauthUri, verifyTotp } from './mfa.js';
+import { SCHOOL_ADMIN_ROLES, getMemberships, requireSchoolAccess } from './tenant.js';
 import { asyncRoute } from './asyncRoute.js';
+import { audited, writeAudit } from './audit.js';
+import { MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
+import { randomInt, timingSafeEqual } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+// Behind Railway's (or any) TLS-terminating proxy, the original scheme
+// and client IP arrive in X-Forwarded-Proto/-For. Only trust them when
+// actually deployed behind one — otherwise any client could spoof its
+// IP (dodging the login rate limit) or claim to be on HTTPS.
+const behindProxy = Boolean(process.env.TRUST_PROXY || process.env.RAILWAY_ENVIRONMENT);
+if (behindProxy) app.set('trust proxy', 1);
+
+// Security headers on every response, plus HTTPS-only when deployed:
+// a plain-HTTP page request is redirected, and a plain-HTTP API call is
+// refused outright rather than redirected (a redirect would already
+// have sent the password/token in the clear). HSTS then tells browsers
+// to never try plain HTTP for this site again.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(), microphone=()');
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:",
+    "connect-src 'self'", "font-src 'self' data:", "object-src 'none'", "base-uri 'self'", "form-action 'self'", "frame-ancestors 'none'",
+  ].join('; '));
+  // /api/health stays reachable over plain HTTP — the platform's own
+  // health check calls the container directly, not through the proxy.
+  if (behindProxy && req.path !== '/api/health') {
+    if (!req.secure) {
+      if (req.path.startsWith('/api/')) return res.status(400).json({ error: 'HTTPS is required.' });
+      return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+    }
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
 
 // The website and API can be deployed as separate services. In that setup the
 // browser needs an explicit CORS grant from this API. Accept a comma-separated
@@ -192,10 +228,210 @@ app.get('/api/health', (req, res) => {
   res.json({ message: 'Backend running' });
 });
 
+// Brute-force guard on sign-in: too many failed attempts within the
+// window locks that account name (from any IP) and that IP (across any
+// account names) until the window passes. A successful sign-in clears
+// the account's counter. In-memory, so it resets on restart and isn't
+// shared between server instances — fine for one instance; move it to
+// the database (or Redis) before running several.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const MAX_FAILURES_PER_ACCOUNT = 5;
+const MAX_FAILURES_PER_IP = 20;
+const loginFailures = new Map(); // key -> { count, resetAt }
+function failureCount(key) {
+  const entry = loginFailures.get(key);
+  if (!entry || entry.resetAt <= Date.now()) { loginFailures.delete(key); return 0; }
+  return entry.count;
+}
+function recordFailure(key) {
+  const count = failureCount(key) + 1;
+  loginFailures.set(key, { count, resetAt: loginFailures.get(key)?.resetAt ?? Date.now() + LOGIN_WINDOW_MS });
+}
+setInterval(() => { for (const key of loginFailures.keys()) failureCount(key); }, LOGIN_WINDOW_MS).unref();
+
+// A failed or locked-out sign-in for a real account is filed under each
+// school that account belongs to, so that school's admins can see
+// someone trying to get into it. One for an unknown email/phone is
+// filed with no school (visible to platform staff only).
+async function auditSignIn(action, identifier, ip) {
+  const user = identifier && await db.prepare('SELECT id, full_name, role FROM users WHERE LOWER(email)=LOWER(?) OR phone=?').get(identifier, identifier);
+  // Every school the account is (or was) in — including suspended
+  // memberships, and each school of a district admin's district.
+  const schoolIds = user ? [...new Set([
+    ...(await db.prepare('SELECT school_id AS "schoolId" FROM memberships WHERE user_id=?').all(user.id)).map(r => r.schoolId),
+    ...(await getMemberships(user.id)).map(m => m.schoolId),
+  ])] : [];
+  for (const schoolId of schoolIds.length ? schoolIds : [null]) {
+    await writeAudit({ schoolId, action, targetType: 'user', targetId: user?.id ?? null, targetLabel: user?.full_name ?? null, details: { identifier }, ip });
+  }
+}
+
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
-  const session = await login(String(req.body.identifier || '').trim(), String(req.body.password || ''));
-  if (!session) return res.status(401).json({ error: 'Invalid email/phone or password' });
+  const identifier = String(req.body.identifier || '').trim();
+  const accountKey = `account:${identifier.toLowerCase()}`;
+  const ipKey = `ip:${req.ip}`;
+  if (failureCount(accountKey) >= MAX_FAILURES_PER_ACCOUNT || failureCount(ipKey) >= MAX_FAILURES_PER_IP) {
+    await auditSignIn('SIGN_IN_LOCKED_OUT', identifier, req.ip);
+    return res.status(429).json({ error: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
+  }
+  const session = await login(identifier, String(req.body.password || ''));
+  if (!session) {
+    recordFailure(accountKey);
+    recordFailure(ipKey);
+    await auditSignIn('SIGN_IN_FAILED', identifier, req.ip);
+    return res.status(401).json({ error: 'Invalid email/phone or password' });
+  }
+  loginFailures.delete(accountKey);
+  // Right password but a second step is still owed: no session yet.
+  if (!session.token) return res.json(session);
+  await auditSignedIn(session, req.ip);
   res.json(session);
+}));
+
+async function auditSignedIn(session, ip, details = null) {
+  for (const schoolId of new Set(session.user.memberships.map(m => m.schoolId))) {
+    await writeAudit({ schoolId, actor: session.user, action: 'SIGNED_IN', targetType: 'user', targetId: session.user.id, details, ip });
+  }
+}
+async function auditForUser(user, action, ip, details = null, actor = user) {
+  const schoolIds = [...new Set((await getMemberships(user.id)).map(m => m.schoolId))];
+  for (const schoolId of schoolIds.length ? schoolIds : [null]) {
+    await writeAudit({ schoolId, actor, action, targetType: 'user', targetId: user.id, targetLabel: user.full_name, details, ip });
+  }
+}
+
+// ---- Two-step verification (see mfa.js / auth.js) ----------------------
+
+// Checks an authenticator code — or, if it's shaped like one, a
+// recovery code (each works once). An authenticator code is refused if
+// its time step was already used, so a code read over someone's
+// shoulder can't be replayed within its 30-second window.
+async function checkSecondFactor(user, code) {
+  if (looksLikeRecoveryCode(code)) {
+    const used = await db.prepare(`UPDATE mfa_recovery_codes SET used_at=${NOW_UTC} WHERE id=(SELECT id FROM mfa_recovery_codes WHERE user_id=? AND code_hash=? AND used_at IS NULL LIMIT 1) RETURNING id`)
+      .get(user.id, hashRecoveryCode(code));
+    return used ? 'RECOVERY_CODE' : null;
+  }
+  if (!user.mfa_secret) return null;
+  const step = verifyTotp(decryptSecret(user.mfa_secret), code);
+  if (step === null) return null;
+  const claimed = await db.prepare('UPDATE users SET mfa_last_step=? WHERE id=? AND (mfa_last_step IS NULL OR mfa_last_step < ?)').run(step, user.id, step);
+  return claimed.changes ? 'AUTHENTICATOR' : null;
+}
+
+async function beginEnrollment(user) {
+  const secret = newTotpSecret();
+  await db.prepare('UPDATE users SET mfa_pending_secret=? WHERE id=?').run(encryptSecret(secret), user.id);
+  return { secret, otpauthUri: otpauthUri(secret, user.email || user.full_name) };
+}
+
+// Turns MFA on once the user proves their app works; returns the new
+// recovery codes (shown once, stored hashed), or null for a wrong code.
+async function finishEnrollment(user, code) {
+  if (!user.mfa_pending_secret) return null;
+  const secret = decryptSecret(user.mfa_pending_secret);
+  const step = verifyTotp(secret, code);
+  if (step === null) return null;
+  const recoveryCodes = newRecoveryCodes();
+  await withTransaction(async () => {
+    await db.prepare(`UPDATE users SET mfa_secret=?, mfa_pending_secret=NULL, mfa_enabled_at=${NOW_UTC}, mfa_last_step=? WHERE id=?`).run(encryptSecret(secret), step, user.id);
+    await replaceRecoveryCodes(user.id, recoveryCodes);
+  });
+  return recoveryCodes;
+}
+
+async function replaceRecoveryCodes(userId, codes) {
+  await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(userId);
+  const insert = db.prepare('INSERT INTO mfa_recovery_codes (id,user_id,code_hash) VALUES (?,?,?)');
+  for (const code of codes) await insert.run(id('recovery'), userId, hashRecoveryCode(code));
+}
+
+const wrongCodeResponse = (res, left) => res.status(left ? 401 : 410).json({
+  error: left ? `That code didn't work. ${left} ${left === 1 ? 'try' : 'tries'} left.` : 'Too many wrong codes. Please sign in again.',
+  restart: !left,
+});
+
+// Second step of sign-in for an account with MFA on.
+app.post('/api/auth/mfa/verify', asyncRoute(async (req, res) => {
+  const challenge = await findChallenge(req.body.mfaToken, 'VERIFY');
+  if (!challenge) return res.status(410).json({ error: 'This sign-in has expired. Please sign in again.', restart: true });
+  const method = await checkSecondFactor(challenge, req.body.code);
+  if (!method) {
+    await auditForUser(challenge, 'MFA_CODE_FAILED', req.ip);
+    return wrongCodeResponse(res, await failChallenge(challenge));
+  }
+  await endChallenge(challenge);
+  const session = await createSession(challenge);
+  await auditSignedIn(session, req.ip, { secondFactor: method });
+  const left = (await db.prepare('SELECT COUNT(*) AS c FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').get(challenge.id)).c;
+  res.json({ ...session, ...(method === 'RECOVERY_CODE' ? { recoveryCodesLeft: left } : {}) });
+}));
+
+// An account that must have MFA but hasn't set it up: enrolls as part of
+// signing in (the password was already checked to get this challenge).
+app.post('/api/auth/mfa/setup', asyncRoute(async (req, res) => {
+  const challenge = await findChallenge(req.body.mfaToken, 'SETUP');
+  if (!challenge) return res.status(410).json({ error: 'This sign-in has expired. Please sign in again.', restart: true });
+  res.json(await beginEnrollment(challenge));
+}));
+
+app.post('/api/auth/mfa/setup/confirm', asyncRoute(async (req, res) => {
+  const challenge = await findChallenge(req.body.mfaToken, 'SETUP');
+  if (!challenge) return res.status(410).json({ error: 'This sign-in has expired. Please sign in again.', restart: true });
+  const recoveryCodes = await finishEnrollment(challenge, req.body.code);
+  if (!recoveryCodes) return wrongCodeResponse(res, await failChallenge(challenge));
+  await endChallenge(challenge);
+  await auditForUser(challenge, 'MFA_ENABLED', req.ip);
+  const session = await createSession(challenge);
+  await auditSignedIn(session, req.ip, { secondFactor: 'AUTHENTICATOR' });
+  res.json({ ...session, recoveryCodes });
+}));
+
+// Managing your own two-step verification while signed in (teachers and
+// parents can opt in here; required accounts can't turn it off).
+const userWithMfa = userId => db.prepare('SELECT * FROM users WHERE id=?').get(userId);
+
+app.get('/api/me/mfa', requireAuth, asyncRoute(async (req, res) => {
+  const user = await userWithMfa(req.user.id);
+  const left = (await db.prepare('SELECT COUNT(*) AS c FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').get(user.id)).c;
+  res.json({ enabled: Boolean(user.mfa_enabled_at), enabledAt: user.mfa_enabled_at, required: await mfaRequiredFor(user), recoveryCodesLeft: left });
+}));
+
+app.post('/api/me/mfa/setup', requireAuth, asyncRoute(async (req, res) => {
+  const user = await userWithMfa(req.user.id);
+  if (user.mfa_enabled_at) return res.status(409).json({ error: 'Two-step verification is already on.' });
+  res.json(await beginEnrollment(user));
+}));
+
+app.post('/api/me/mfa/confirm', requireAuth, asyncRoute(async (req, res) => {
+  const user = await userWithMfa(req.user.id);
+  if (user.mfa_enabled_at) return res.status(409).json({ error: 'Two-step verification is already on.' });
+  const recoveryCodes = await finishEnrollment(user, req.body.code);
+  if (!recoveryCodes) return res.status(401).json({ error: "That code didn't work. Check the time on your phone and try the newest code." });
+  await auditForUser(user, 'MFA_ENABLED', req.ip);
+  res.json({ recoveryCodes });
+}));
+
+app.post('/api/me/mfa/recovery-codes', requireAuth, asyncRoute(async (req, res) => {
+  const user = await userWithMfa(req.user.id);
+  if (!user.mfa_enabled_at) return res.status(409).json({ error: 'Two-step verification is off.' });
+  if (await checkSecondFactor(user, req.body.code) !== 'AUTHENTICATOR') return res.status(401).json({ error: 'Enter the current code from your authenticator app.' });
+  const recoveryCodes = newRecoveryCodes();
+  await replaceRecoveryCodes(user.id, recoveryCodes);
+  await auditForUser(user, 'MFA_RECOVERY_CODES_REPLACED', req.ip);
+  res.json({ recoveryCodes });
+}));
+
+app.post('/api/me/mfa/disable', requireAuth, asyncRoute(async (req, res) => {
+  const user = await userWithMfa(req.user.id);
+  if (await mfaRequiredFor(user)) return res.status(403).json({ error: 'Two-step verification is required for your account and cannot be turned off.' });
+  if (!verifyPassword(String(req.body.password || ''), user.password_hash).ok) return res.status(401).json({ error: 'Password is incorrect.' });
+  await withTransaction(async () => {
+    await db.prepare('UPDATE users SET mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL WHERE id=?').run(user.id);
+    await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(user.id);
+  });
+  await auditForUser(user, 'MFA_DISABLED', req.ip);
+  res.status(204).end();
 }));
 
 app.post('/api/auth/logout', requireAuth, asyncRoute(async (req, res) => {
@@ -208,14 +444,12 @@ app.get('/api/me/schools', requireAuth, asyncRoute(async (req, res) => {
   res.json(await getMemberships(req.user.id));
 }));
 
-app.post('/api/me/change-password', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req => ({ targetType: 'user', targetId: req.user.id, details: null })), asyncRoute(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Current and new password are required' });
   if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
   const user = await db.prepare('SELECT password_hash FROM users WHERE id=?').get(req.user.id);
-  const actual = Buffer.from(user.password_hash, 'hex');
-  const supplied = Buffer.from(passwordHash(currentPassword), 'hex');
-  if (actual.length !== supplied.length || !timingSafeEqual(actual, supplied)) {
+  if (!verifyPassword(currentPassword, user.password_hash).ok) {
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
   await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(passwordHash(newPassword), req.user.id);
@@ -232,7 +466,7 @@ const codeFromSchoolName = name => name.toUpperCase().replace(/[^A-Z0-9]/g, '').
 // additional classes/school years still needs an admin UI that
 // doesn't exist yet (see CUSTOMER_OPERATIONS_GUIDE.md's production
 // readiness list).
-app.post('/api/auth/register-school', asyncRoute(async (req, res) => {
+app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(async (req, res) => {
   const { schoolName, campusName, campusAddress, adminFullName, email, password } = req.body;
   if (!schoolName?.trim() || !campusName?.trim() || !adminFullName?.trim() || !email?.trim() || !password) {
     return res.status(400).json({ error: 'School name, campus name, your name, email, and password are all required.' });
@@ -272,9 +506,16 @@ app.post('/api/auth/register-school', asyncRoute(async (req, res) => {
       await db.prepare(`INSERT INTO school_years (id,school_id,name,starts_on,ends_on,status) VALUES (?,?,?,?,?,'ACTIVE')`)
         .run(id('year'), schoolId, `${startYear}-${startYear + 1}`, `${startYear}-08-01`, `${startYear + 1}-06-30`);
 
-      return login(email.trim(), password);
+      // Admins must use two-step verification, so this is normally a
+      // { mfaSetupRequired, mfaToken } challenge rather than a session —
+      // the new admin sets up their authenticator before landing in the dashboard.
+      return { schoolId, userId, session: await login(email.trim(), password) };
     });
-    res.status(201).json(result);
+    res.locals.audit = {
+      schoolId: result.schoolId, actor: { id: result.userId, full_name: adminFullName.trim() }, actorRole: 'school_admin',
+      targetType: 'school', targetId: result.schoolId,
+    };
+    res.status(201).json(result.session);
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
@@ -297,7 +538,11 @@ const studentSelect = `
 
 app.get('/api/me/students', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,tu.full_name,sc.name,cp.name,cp.latitude,cp.longitude,cp.geofence_radius ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
-  res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare) })));
+  // The pickup code for a child's pending pickup — only to the adult who
+  // requested it, never to other guardians of the same child.
+  const codes = new Map((await db.prepare(`SELECT student_id AS "studentId", pickup_code AS "pickupCode" FROM queue_items WHERE requested_by_user_id=? AND status='PENDING' AND request_type='PICK_UP' AND pickup_code IS NOT NULL`)
+    .all(req.user.id)).map(row => [row.studentId, row.pickupCode]));
+  res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare), pickupCode: codes.get(row.id) ?? null })));
 }));
 
 // Read-only attendance history for a parent's own children — every
@@ -310,6 +555,7 @@ app.get('/api/me/attendance', requireAuth, requireRole('parent'), asyncRoute(asy
     FROM students s
     JOIN student_guardians sg ON sg.student_id=s.id
     JOIN guardians gu ON gu.id=sg.guardian_id
+    JOIN memberships pm ON pm.user_id=gu.user_id AND pm.school_id=s.school_id AND pm.role='parent' AND pm.status='ACTIVE'
     JOIN student_enrollments e ON e.student_id=s.id
     JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
     LEFT JOIN classes c ON c.id=e.class_id
@@ -328,12 +574,41 @@ app.get('/api/me/attendance', requireAuth, requireRole('parent'), asyncRoute(asy
   res.json([...byStudent.values()]);
 }));
 
+// The parent Class tab's "My Class" view — one entry per child (siblings
+// in the same class still get a card each), with their grade, room and
+// teacher.
+app.get('/api/me/classes', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  const children = await db.prepare(`
+    SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl", g.name AS "gradeName",
+      c.id AS "classId", c.name AS "className", c.room_name AS "roomName", u.full_name AS "teacherName"
+    FROM students s
+    JOIN student_guardians sg ON sg.student_id=s.id
+    JOIN guardians gu ON gu.id=sg.guardian_id
+    JOIN memberships pm ON pm.user_id=gu.user_id AND pm.school_id=s.school_id AND pm.role='parent' AND pm.status='ACTIVE'
+    JOIN student_enrollments e ON e.student_id=s.id
+    JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
+    LEFT JOIN grade_levels g ON g.id=e.grade_level_id
+    LEFT JOIN classes c ON c.id=e.class_id
+    LEFT JOIN users u ON u.id=c.teacher_user_id
+    WHERE gu.user_id=? AND s.status='ACTIVE'
+    GROUP BY s.id, g.name, c.id, c.name, c.room_name, u.full_name
+    ORDER BY s.last_name, s.first_name`).all(req.user.id);
+
+  res.json(children.map(({ classId, ...child }) => child));
+}));
+
 // Real drop-off/pick-up queue, shared by every client (mobile + web,
 // any role) via the database — replaces the old in-memory mock that
 // only ever synced within one running app process.
+// Requires the parent's membership in *this student's* school to be
+// ACTIVE — a parent suspended at one school can't act on children there
+// even if they're still active at another.
 const guardianLinkQuery = db.prepare(`
   SELECT sg.can_pick_up AS "canPickUp" FROM student_guardians sg
-  JOIN guardians gu ON gu.id=sg.guardian_id WHERE sg.student_id=? AND gu.user_id=?`);
+  JOIN guardians gu ON gu.id=sg.guardian_id
+  JOIN students s ON s.id=sg.student_id
+  JOIN memberships pm ON pm.user_id=gu.user_id AND pm.school_id=s.school_id AND pm.role='parent' AND pm.status='ACTIVE'
+  WHERE sg.student_id=? AND gu.user_id=?`);
 const studentContextQuery = db.prepare(`
   SELECT s.school_id AS "schoolId", s.campus_id AS "campusId", c.teacher_user_id AS "teacherId", e.class_id AS "classId", s.pickup_status AS "pickupStatus",
     cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius"
@@ -351,6 +626,20 @@ function distanceMeters(a, b) {
   const lat1 = radians(a.latitude); const lat2 = radians(b.latitude);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+}
+
+// Pickup verification: every pickup request gets its own random 6-digit
+// code, shown only on the requesting adult's phone. The teacher (or an
+// admin) has to type it in to release the child — so a pickup can't be
+// accepted just because someone is signed in to a parent's account
+// somewhere; the person at the door has to hold the phone that asked.
+// The code is single-use (cleared once the request is decided) and
+// MAX_PICKUP_CODE_ATTEMPTS wrong entries cancel the request.
+const MAX_PICKUP_CODE_ATTEMPTS = 5;
+const newPickupCode = () => String(randomInt(0, 1_000_000)).padStart(6, '0');
+function pickupCodeMatches(expected, supplied) {
+  const a = Buffer.from(String(expected)); const b = Buffer.from(String(supplied ?? '').replace(/\s/g, ''));
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 async function createQueueRequest(req, res, requestType, requiredStatus, nextStatus) {
@@ -382,22 +671,24 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
   }
   try {
     const itemId = id('queue');
+    const pickupCode = requestType === 'PICK_UP' ? newPickupCode() : null;
     await withTransaction(async () => {
-      await db.prepare(`INSERT INTO queue_items (id,school_id,campus_id,student_id,teacher_user_id,request_type,requested_by_user_id) VALUES (?,?,?,?,?,?,?)`)
-        .run(itemId, context.schoolId, context.campusId, req.params.studentId, context.teacherId, requestType, req.user.id);
+      await db.prepare(`INSERT INTO queue_items (id,school_id,campus_id,student_id,teacher_user_id,request_type,requested_by_user_id,pickup_code) VALUES (?,?,?,?,?,?,?,?)`)
+        .run(itemId, context.schoolId, context.campusId, req.params.studentId, context.teacherId, requestType, req.user.id, pickupCode);
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(nextStatus, req.params.studentId);
     });
-    res.status(201).json({ id: itemId });
+    res.locals.audit = { schoolId: context.schoolId, details: { queueItemId: itemId } };
+    res.status(201).json({ id: itemId, ...(pickupCode ? { pickupCode } : {}) });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
 }
 
-app.post('/api/me/students/:studentId/drop-off', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+app.post('/api/me/students/:studentId/drop-off', requireAuth, requireRole('parent'), audited('DROPOFF_REQUESTED', req => ({ targetType: 'student', targetId: req.params.studentId, details: null })), asyncRoute(async (req, res) => {
   await createQueueRequest(req, res, 'DROP_OFF', 'AT_HOME', 'DROPOFF_REQUESTED');
 }));
 
-app.post('/api/me/students/:studentId/pick-up', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+app.post('/api/me/students/:studentId/pick-up', requireAuth, requireRole('parent'), audited('PICKUP_REQUESTED', req => ({ targetType: 'student', targetId: req.params.studentId, details: null })), asyncRoute(async (req, res) => {
   await createQueueRequest(req, res, 'PICK_UP', 'PRESENT', 'PICKUP_REQUESTED');
 }));
 
@@ -405,7 +696,7 @@ const queueSelect = `
   SELECT qi.id, qi.student_id AS "childId", s.first_name || ' ' || s.last_name AS "childName",
     s.photo_url AS "childPhotoUrl", c.name AS "className",
     qi.teacher_user_id AS "teacherId", qi.request_type AS "requestType", qi.requested_at AS "requestedAt",
-    u.full_name AS "parentName"
+    u.full_name AS "parentName", (qi.pickup_code IS NOT NULL) AS "requiresCode"
   FROM queue_items qi
   JOIN students s ON s.id=qi.student_id
   JOIN users u ON u.id=qi.requested_by_user_id
@@ -417,6 +708,12 @@ app.get('/api/teacher/queue', requireAuth, requireRole('teacher'), asyncRoute(as
   res.json(await db.prepare(`${queueSelect} WHERE qi.status='PENDING' AND qi.teacher_user_id=? ORDER BY qi.requested_at ASC`).all(req.user.id));
 }));
 
+// Front desk / office staff (membership role 'staff') get read access
+// to the admin console — queue, attendance, students, families,
+// messages — but every /api/admin route that changes data is
+// school_admin-only (platform_super_admin always passes too): staff
+// can't create or suspend accounts, edit students or guardians, change
+// pickup authorization, run promotions or change school settings.
 app.get('/api/admin/queue', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json(await db.prepare(`${queueSelect} WHERE qi.status='PENDING' AND qi.school_id=? ORDER BY qi.requested_at ASC`).all(req.school.id));
 }));
@@ -424,15 +721,54 @@ app.get('/api/admin/queue', requireAuth, requireSchoolAccess('school_admin', 'st
 // A teacher may approve only their own class's requests; an admin may
 // approve anything in a school they belong to (mirrors the Live Queue
 // screens: admin sees and can act on every class, teacher only theirs).
-app.post('/api/queue/:id/approve', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/queue/:id/approve', requireAuth, audited('QUEUE_REQUEST_ACCEPTED'), asyncRoute(async (req, res) => {
   const item = await db.prepare(`SELECT * FROM queue_items WHERE id=? AND status='PENDING'`).get(req.params.id);
   if (!item) return res.status(404).json({ error: 'Request not found or already handled.' });
-  const isOwningTeacher = req.user.role === 'teacher' && item.teacher_user_id === req.user.id;
-  const isSchoolAdmin = (await getMemberships(req.user.id)).some(m => m.schoolId === item.school_id && ['school_admin', 'platform_super_admin'].includes(m.role));
+  const memberships = await getMemberships(req.user.id);
+  const isOwningTeacher = req.user.role === 'teacher' && item.teacher_user_id === req.user.id && memberships.some(m => m.schoolId === item.school_id && m.role === 'teacher');
+  const isSchoolAdmin = memberships.some(m => m.schoolId === item.school_id && SCHOOL_ADMIN_ROLES.includes(m.role));
   if (!isOwningTeacher && !isSchoolAdmin) return res.status(403).json({ error: 'You do not have permission to approve this request.' });
+  res.locals.audit = {
+    schoolId: item.school_id, action: item.request_type === 'DROP_OFF' ? 'DROPOFF_ACCEPTED' : 'PICKUP_ACCEPTED',
+    targetType: 'student', targetId: item.student_id, details: { queueItemId: item.id, requestedByUserId: item.requested_by_user_id },
+  };
+
+  // Pickup verification (see newPickupCode). A request from before codes
+  // existed has no pickup_code and goes through as before.
+  let verificationMethod = null; let overrideReason = null;
+  if (item.request_type === 'PICK_UP' && item.pickup_code) {
+    const reason = typeof req.body?.overrideReason === 'string' ? req.body.overrideReason.trim() : '';
+    if (reason) {
+      if (!isSchoolAdmin) return res.status(403).json({ error: 'Only an administrator can release a child without the pickup code.' });
+      verificationMethod = 'ADMIN_OVERRIDE'; overrideReason = reason.slice(0, 500);
+    } else if (pickupCodeMatches(item.pickup_code, req.body?.code)) {
+      verificationMethod = 'CODE';
+    } else {
+      const audit = { schoolId: item.school_id, actor: req.user, targetType: 'student', targetId: item.student_id, ip: req.ip };
+      const { attempts } = await db.prepare(`UPDATE queue_items SET pickup_code_attempts=pickup_code_attempts+1 WHERE id=? RETURNING pickup_code_attempts AS attempts`).get(item.id);
+      if (attempts >= MAX_PICKUP_CODE_ATTEMPTS) {
+        await withTransaction(async () => {
+          await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL, declined_at=${NOW_UTC}, declined_by_user_id=? WHERE id=? AND status='PENDING'`).run(req.user.id, item.id);
+          await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id=?`).run(item.student_id);
+          await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+            .run(id('notice'), item.school_id, item.campus_id, req.user.id, req.user.full_name, req.user.role === 'teacher' ? 'teacher' : 'admin',
+              'Pickup cancelled', 'Your pickup request was cancelled because the wrong pickup code was entered too many times. Please request the pickup again from your phone.', 'PARENT', item.requested_by_user_id);
+        });
+        await writeAudit({ ...audit, action: 'PICKUP_CODE_LOCKED_OUT', details: { queueItemId: item.id, attempts } });
+        return res.status(409).json({ error: 'Too many wrong codes. This pickup request has been cancelled; the parent needs to request it again.' });
+      }
+      await writeAudit({ ...audit, action: 'PICKUP_CODE_REJECTED', details: { queueItemId: item.id, attempts } });
+      const left = MAX_PICKUP_CODE_ATTEMPTS - attempts;
+      return res.status(422).json({ error: `Wrong pickup code. ${left} ${left === 1 ? 'try' : 'tries'} left.` });
+    }
+    res.locals.audit.details = { ...res.locals.audit.details, verificationMethod, overrideReason };
+  }
+
   try {
     await withTransaction(async () => {
-      await db.prepare(`UPDATE queue_items SET status='APPROVED', approved_at=${NOW_UTC}, approved_by_user_id=? WHERE id=?`).run(req.user.id, item.id);
+      const claimed = await db.prepare(`UPDATE queue_items SET status='APPROVED', approved_at=${NOW_UTC}, approved_by_user_id=?, pickup_code=NULL, verification_method=?, override_reason=? WHERE id=? AND status='PENDING'`)
+        .run(req.user.id, verificationMethod, overrideReason, item.id);
+      if (claimed.changes === 0) throw new Error('This request was already handled.');
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'PRESENT' : 'PICKED_UP', item.student_id);
       // Accepting a drop-off also marks today's attendance PRESENT, so
       // the teacher doesn't have to separately mark it by hand on the
@@ -464,15 +800,20 @@ app.post('/api/queue/:id/approve', requireAuth, asyncRoute(async (req, res) => {
 // where they were before the request (AT_HOME for a declined drop-off,
 // PRESENT for a declined pick-up) so the parent isn't stuck showing a
 // pending request that will never clear, and can try again.
-app.post('/api/queue/:id/decline', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/queue/:id/decline', requireAuth, audited('QUEUE_REQUEST_DECLINED'), asyncRoute(async (req, res) => {
   const item = await db.prepare(`SELECT * FROM queue_items WHERE id=? AND status='PENDING'`).get(req.params.id);
   if (!item) return res.status(404).json({ error: 'Request not found or already handled.' });
-  const isOwningTeacher = req.user.role === 'teacher' && item.teacher_user_id === req.user.id;
-  const isSchoolAdmin = (await getMemberships(req.user.id)).some(m => m.schoolId === item.school_id && ['school_admin', 'platform_super_admin'].includes(m.role));
+  const memberships = await getMemberships(req.user.id);
+  const isOwningTeacher = req.user.role === 'teacher' && item.teacher_user_id === req.user.id && memberships.some(m => m.schoolId === item.school_id && m.role === 'teacher');
+  const isSchoolAdmin = memberships.some(m => m.schoolId === item.school_id && SCHOOL_ADMIN_ROLES.includes(m.role));
   if (!isOwningTeacher && !isSchoolAdmin) return res.status(403).json({ error: 'You do not have permission to decline this request.' });
+  res.locals.audit = {
+    schoolId: item.school_id, action: item.request_type === 'DROP_OFF' ? 'DROPOFF_DECLINED' : 'PICKUP_DECLINED',
+    targetType: 'student', targetId: item.student_id, details: { queueItemId: item.id, requestedByUserId: item.requested_by_user_id },
+  };
   try {
     await withTransaction(async () => {
-      await db.prepare(`UPDATE queue_items SET status='DECLINED', declined_at=${NOW_UTC}, declined_by_user_id=? WHERE id=?`).run(req.user.id, item.id);
+      await db.prepare(`UPDATE queue_items SET status='DECLINED', declined_at=${NOW_UTC}, declined_by_user_id=?, pickup_code=NULL WHERE id=?`).run(req.user.id, item.id);
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'AT_HOME' : 'PRESENT', item.student_id);
     });
     res.status(204).end();
@@ -527,7 +868,7 @@ app.get('/api/teacher/class', requireAuth, requireRole('teacher'), asyncRoute(as
 // Students), but can't change it here. A removed (ARCHIVED) student is
 // filtered out entirely rather than shown with a status, since there's
 // nothing left for a teacher to do about them.
-app.get('/api/teacher/students', requireAuth, requireRole('teacher'), asyncRoute(async (req, res) => {
+app.get('/api/teacher/students', requireAuth, requireRole('teacher'), audited('CLASS_ROSTER_VIEWED', (req, body) => ({ details: { studentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
     SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl", s.status
     FROM students s
@@ -543,7 +884,7 @@ app.get('/api/teacher/students', requireAuth, requireRole('teacher'), asyncRoute
 // /api/me/attendance's shape (per-student record list) so the same kind
 // of month-by-month history view can be built for a teacher's whole
 // class instead of just a parent's own children.
-app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), asyncRoute(async (req, res) => {
+app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), audited('ATTENDANCE_HISTORY_VIEWED', (req, body) => ({ details: { studentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
     SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName",
       ar.date, ar.status, ar.late
@@ -565,7 +906,7 @@ app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), 
   res.json([...byStudent.values()]);
 }));
 
-app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.get('/api/admin/attendance', requireAuth, requireSchoolAccess('school_admin', 'staff'), audited('ATTENDANCE_VIEWED', (req, body) => ({ details: { date: req.query.date || null, studentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   if (!req.query.classId) return res.status(400).json({ error: 'classId is required' });
   const date = req.query.date || todayIso();
   const rows = await db.prepare(`${attendanceSelect} AND s.school_id=? AND e.class_id=? ORDER BY s.last_name,s.first_name`).all(date, date, req.school.id, req.query.classId);
@@ -597,7 +938,7 @@ app.get('/api/admin/attendance/summary', requireAuth, requireSchoolAccess('schoo
 // mark it for anything in a school they belong to — same split as the
 // live queue's approve permission.
 const ATTENDANCE_STATUSES = ['PRESENT', 'ABSENT', 'SICK', 'SUSPENDED', 'HOLIDAY', 'WEEKEND'];
-app.post('/api/attendance', requireAuth, asyncRoute(async (req, res) => {
+app.post('/api/attendance', requireAuth, audited('ATTENDANCE_MARKED', req => ({ targetType: 'student', targetId: req.body.studentId, details: { date: req.body.date, status: req.body.status } })), asyncRoute(async (req, res) => {
   const { studentId, date, status } = req.body;
   if (!studentId || !date || !ATTENDANCE_STATUSES.includes(status)) {
     return res.status(400).json({ error: `studentId, date, and a status of ${ATTENDANCE_STATUSES.join('/')} are required` });
@@ -610,9 +951,11 @@ app.post('/api/attendance', requireAuth, asyncRoute(async (req, res) => {
     LEFT JOIN classes c ON c.id=e.class_id
     WHERE s.id=? AND s.status='ACTIVE'`).get(studentId);
   if (!context) return res.status(404).json({ error: 'Student not found' });
-  const isOwningTeacher = req.user.role === 'teacher' && context.teacherId === req.user.id;
-  const isSchoolAdmin = (await getMemberships(req.user.id)).some(m => m.schoolId === context.schoolId && ['school_admin', 'platform_super_admin'].includes(m.role));
+  const memberships = await getMemberships(req.user.id);
+  const isOwningTeacher = req.user.role === 'teacher' && context.teacherId === req.user.id && memberships.some(m => m.schoolId === context.schoolId && m.role === 'teacher');
+  const isSchoolAdmin = memberships.some(m => m.schoolId === context.schoolId && SCHOOL_ADMIN_ROLES.includes(m.role));
   if (!isOwningTeacher && !isSchoolAdmin) return res.status(403).json({ error: 'You do not have permission to mark attendance for this student.' });
+  res.locals.audit = { schoolId: context.schoolId };
   await db.prepare(`
     INSERT INTO attendance_records (id,school_id,campus_id,student_id,class_id,date,status,marked_by_user_id) VALUES (?,?,?,?,?,?,?,?)
     ON CONFLICT(student_id,date) DO UPDATE SET status=excluded.status, marked_by_user_id=excluded.marked_by_user_id, marked_at=${NOW_UTC}`)
@@ -643,7 +986,7 @@ app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin', 'st
 // lexicographic time comparison the late-arrival check below relies on.
 const isValidClockTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 
-app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'), audited('SCHOOL_SETTINGS_UPDATED', req => ({ targetType: 'school', targetId: req.school.id })), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime } = req.body;
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
     if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
@@ -675,7 +1018,7 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin', 
 // admin to pick a number up front; editable afterward in School Setup.
 const DEFAULT_GEOFENCE_RADIUS_METERS = 150;
 
-app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin'), audited('LOCATION_CREATED', (req, body) => ({ targetType: 'campus', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (!name?.trim()) return res.status(400).json({ error: 'Location name is required' });
   const addressFields = addressFieldsFromInput(req.body);
@@ -709,7 +1052,7 @@ app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin',
   }
 }));
 
-app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), audited('LOCATION_UPDATED', req => ({ targetType: 'campus', targetId: req.params.id })), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (address !== undefined && !address.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
@@ -776,7 +1119,7 @@ app.get('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin', '
     ORDER BY y.starts_on DESC, g.sort_order, c.name`).all(req.school.id));
 }));
 
-app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'), audited('CLASS_CREATED', (req, body) => ({ targetType: 'class', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { name, gradeLevelId, roomName, schoolYearId, campusId } = req.body;
   if (!name?.trim() || !gradeLevelId || !schoolYearId) return res.status(400).json({ error: 'Class name, grade, and school year are required' });
   const year = await db.prepare('SELECT id FROM school_years WHERE id=? AND school_id=?').get(schoolYearId, req.school.id);
@@ -807,7 +1150,7 @@ app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 
   res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
 }));
 
-app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_CREATED', (req, body) => ({ targetType: 'user', targetId: body?.id, details: { role: 'teacher', email: req.body.email, classId: req.body.classId } })), asyncRoute(async (req, res) => {
   const { fullName, email, password, photoDataUrl, classId } = req.body;
   if (!fullName?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
@@ -844,7 +1187,7 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin',
 // Edit an existing teacher: name, photo, and/or which classroom they're
 // assigned to (passing classId: null unassigns them; omitting it leaves
 // the assignment as-is). No password reset here — out of scope for now.
-app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_UPDATED', req => ({ targetType: 'user', targetId: req.params.id, details: { fullName: req.body.fullName, classId: req.body.classId, photoChanged: req.body.photoDataUrl !== undefined } })), asyncRoute(async (req, res) => {
   const membership = await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role='teacher'`).get(req.params.id, req.school.id);
   if (!membership) return res.status(404).json({ error: 'Teacher not found in this school' });
   const { fullName, photoDataUrl, classId } = req.body;
@@ -873,8 +1216,8 @@ app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_ad
 // elsewhere). 'admin' and 'front_desk' both get a users.role='admin'
 // login (routed to the admin dashboard by the frontend); 'front_desk'
 // is tagged with the 'staff' membership role so it's a distinct entry
-// in the Staff list even though — per requireSchoolAccess above — it
-// carries the exact same route access as school_admin.
+// in the Staff list — and, unlike school_admin, it only gets read access
+// to the admin routes (see the note above /api/admin/queue).
 const STAFF_ROLES = {
   teacher: { userRole: 'teacher', membershipRole: 'teacher' },
   admin: { userRole: 'admin', membershipRole: 'school_admin' },
@@ -884,7 +1227,7 @@ const STAFF_ROLES = {
 app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
     SELECT u.id, u.full_name AS "fullName", u.email, u.photo_url AS "photoUrl", m.status, m.role,
-      c.id AS "classId", c.name AS "className"
+      (u.mfa_enabled_at IS NOT NULL) AS "mfaEnabled", c.id AS "classId", c.name AS "className"
     FROM memberships m
     JOIN users u ON u.id=m.user_id
     LEFT JOIN classes c ON c.teacher_user_id=u.id AND c.school_id=?
@@ -893,7 +1236,7 @@ app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'st
   res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
 }));
 
-app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_CREATED', (req, body) => ({ targetType: 'user', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { fullName, email, password, photoDataUrl, classId, role } = req.body;
   const roleConfig = STAFF_ROLES[role];
   if (!roleConfig) return res.status(400).json({ error: 'role must be one of teacher, admin, front_desk' });
@@ -934,7 +1277,7 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 's
 // archives the membership and, for a teacher, frees up their classroom.
 // Either way, an admin can't take either action on their own account —
 // that would risk locking every admin out of the school at once.
-app.patch('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_STATUS_CHANGED', req => ({ targetType: 'user', targetId: req.params.id, details: { status: req.body.active ? 'ACTIVE' : 'SUSPENDED' } })), asyncRoute(async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot change your own status' });
   const status = req.body.active ? 'ACTIVE' : 'SUSPENDED';
   const result = await db.prepare(`UPDATE memberships SET status=? WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff')`).run(status, req.params.id, req.school.id);
@@ -942,7 +1285,23 @@ app.patch('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin
   res.status(204).end();
 }));
 
-app.delete('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+// Lost phone and recovery codes: another admin clears the person's
+// two-step verification and signs them out everywhere. They set it up
+// again at their next sign-in (or may, if it's optional for them).
+// Not for your own account — that needs a second admin.
+app.post('/api/admin/staff/:id/reset-mfa', requireAuth, requireSchoolAccess('school_admin'), audited('MFA_RESET', req => ({ targetType: 'user', targetId: req.params.id, details: null })), asyncRoute(async (req, res) => {
+  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Ask another administrator to reset your two-step verification.' });
+  const member = await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff')`).get(req.params.id, req.school.id);
+  if (!member) return res.status(404).json({ error: 'Staff member not found in this school' });
+  await withTransaction(async () => {
+    await db.prepare('UPDATE users SET mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL WHERE id=?').run(req.params.id);
+    await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(req.params.id);
+  });
+  await endAllSessions(req.params.id);
+  res.status(204).end();
+}));
+
+app.delete('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_REMOVED', req => ({ targetType: 'user', targetId: req.params.id })), asyncRoute(async (req, res) => {
   if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
   const result = await db.prepare(`UPDATE memberships SET status='ARCHIVED' WHERE user_id=? AND school_id=? AND role IN ('teacher','school_admin','staff')`).run(req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Staff member not found in this school' });
@@ -950,8 +1309,9 @@ app.delete('/api/admin/staff/:id', requireAuth, requireSchoolAccess('school_admi
   res.status(204).end();
 }));
 
-app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
-  const active = await db.prepare(`${studentSelect} WHERE s.school_id=? AND y.status='ACTIVE' ORDER BY s.last_name,s.first_name`).all(req.school.id);
+app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 'staff'), audited('STUDENT_LIST_VIEWED', (req, body) => ({ details: { studentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
+  // Removed (ARCHIVED) students are listed separately, under Data & Privacy.
+  const active = await db.prepare(`${studentSelect} WHERE s.school_id=? AND y.status='ACTIVE' AND s.status<>'ARCHIVED' ORDER BY s.last_name,s.first_name`).all(req.school.id);
   const guardianQuery = db.prepare(`SELECT gu.id,u.full_name AS "fullName",u.email,sg.relationship,sg.can_pick_up AS "canPickUp",sg.is_primary AS "isPrimary" FROM student_guardians sg JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id WHERE sg.student_id=?`);
   // `status` mirrors pickupStatus everywhere else this shape is used (the
   // Child type); the real enrollment status (ACTIVE/SUSPENDED) that admin
@@ -960,7 +1320,7 @@ app.get('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 
   res.json(students);
 }));
 
-app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_CREATED', (req, body) => ({ targetType: 'student', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { firstName, lastName, dateOfBirth, studentNumber, photoDataUrl, schoolYearId, gradeLevelId, classId, daycare, guardian } = req.body;
   if (!firstName?.trim() || !lastName?.trim() || !schoolYearId || !gradeLevelId) return res.status(400).json({ error: 'Name, school year, and grade are required' });
   if (!classId) return res.status(400).json({ error: 'Select a class so pickup requests reach a teacher' });
@@ -1005,7 +1365,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin',
   }
 }));
 
-app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolAccess('school_admin'), audited('PICKUP_AUTHORIZATION_CHANGED', req => ({ targetType: 'student', targetId: req.params.studentId })), asyncRoute(async (req, res) => {
   const { guardianId, relationship = 'Guardian', canPickUp = true, canManage = true } = req.body;
   try {
     const allowed = await db.prepare(`SELECT 1 FROM students s JOIN guardians gu ON gu.id=? JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.status='ACTIVE' WHERE s.id=? AND s.school_id=?`).get(guardianId, req.params.studentId, req.school.id);
@@ -1018,27 +1378,27 @@ app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolA
 // Suspend blocks login (auth.js's login query requires active=1); delete
 // removes the user outright and cascades to their guardian row and any
 // student_guardians links (both declared ON DELETE CASCADE).
-app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_STATUS_CHANGED', req => ({ targetType: 'student', targetId: req.params.id, details: { status: req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE' } })), asyncRoute(async (req, res) => {
   const status = req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
   const result = await db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
   res.status(204).end();
 }));
 
-app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
-  const result = await db.prepare(`UPDATE students SET status='ARCHIVED' WHERE id=? AND school_id=?`).run(req.params.id, req.school.id);
+app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_REMOVED', req => ({ targetType: 'student', targetId: req.params.id })), asyncRoute(async (req, res) => {
+  const result = await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at=${NOW_UTC} WHERE id=? AND school_id=? AND status<>'ARCHIVED'`).run(req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
   res.status(204).end();
 }));
 
-app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), audited('PARENT_LIST_VIEWED', (req, body) => ({ details: { parentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.id AS "userId", u.full_name AS "fullName", u.email, u.phone, m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
   const children = db.prepare(`SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName" FROM student_guardians sg JOIN students s ON s.id=sg.student_id WHERE sg.guardian_id=? AND s.school_id=?`);
   const result = await Promise.all(guardians.map(async g => ({ ...g, active: g.status === 'ACTIVE', children: await children.all(g.id, req.school.id) })));
   res.json(result);
 }));
 
-app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'), audited('PARENT_CREATED', (req, body) => ({ targetType: 'guardian', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { fullName, email, phone, temporaryPassword } = req.body;
   if (!fullName?.trim() || !email?.trim() || !temporaryPassword) return res.status(400).json({ error: 'Name, email, and temporary password are required' });
   try {
@@ -1063,7 +1423,7 @@ app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'
   }
 }));
 
-app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin'), audited('PARENT_STATUS_CHANGED', req => ({ targetType: 'guardian', targetId: req.params.id, details: { status: req.body.active ? 'ACTIVE' : 'SUSPENDED' } })), asyncRoute(async (req, res) => {
   const guardian = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(req.params.id);
   if (!guardian) return res.status(404).json({ error: 'Guardian not found' });
   const result = await db.prepare(`UPDATE memberships SET status=? WHERE user_id=? AND school_id=? AND role='parent'`).run(req.body.active ? 'ACTIVE' : 'SUSPENDED', guardian.user_id, req.school.id);
@@ -1071,7 +1431,7 @@ app.patch('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_a
   res.status(204).end();
 }));
 
-app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_admin'), audited('PARENT_REMOVED', req => ({ targetType: 'guardian', targetId: req.params.id, details: { pickupAuthorizationRemoved: true } })), asyncRoute(async (req, res) => {
   const guardian = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(req.params.id);
   if (!guardian) return res.status(404).json({ error: 'Guardian not found' });
   const result = await db.prepare(`UPDATE memberships SET status='ARCHIVED' WHERE user_id=? AND school_id=? AND role='parent'`).run(guardian.user_id, req.school.id);
@@ -1080,7 +1440,7 @@ app.delete('/api/admin/guardians/:id', requireAuth, requireSchoolAccess('school_
   res.status(204).end();
 }));
 
-app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
   const from = req.query.from; const to = req.query.to;
   const rows = await db.prepare(`${studentSelect} WHERE e.school_year_id=? AND s.school_id=? AND e.status='ENROLLED' ORDER BY s.last_name,s.first_name`).all(from, req.school.id);
   const next = db.prepare('SELECT id,name FROM grade_levels WHERE id=(SELECT next_grade_level_id FROM grade_levels WHERE id=?)');
@@ -1089,7 +1449,7 @@ app.get('/api/admin/promotions/preview', requireAuth, requireSchoolAccess('schoo
   res.json(result);
 }));
 
-app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin'), audited('PROMOTION_RUN', (req, body) => ({ details: { type: 'whole-school', fromSchoolYearId: req.body.fromSchoolYearId, toSchoolYearId: req.body.toSchoolYearId, promoted: body?.promoted } })), asyncRoute(async (req, res) => {
   const { fromSchoolYearId, toSchoolYearId, overrides = {} } = req.body;
   try {
     const promoted = await withTransaction(async () => {
@@ -1120,7 +1480,7 @@ app.post('/api/admin/promotions', requireAuth, requireSchoolAccess('school_admin
 // still only gets one enrollment per school year, same as any other
 // enrollment path), unlike the whole-cohort run above which is a
 // one-shot per (fromYear,toYear) pair.
-app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('school_admin'), audited('PROMOTION_RUN', (req, body) => ({ details: { type: 'by-grade', ...req.body, promoted: body?.promoted, skipped: body?.skipped } })), asyncRoute(async (req, res) => {
   const { fromSchoolYearId, toSchoolYearId, fromGradeLevelId, toGradeLevelId, teacherUserId } = req.body;
   if (!fromSchoolYearId || !toSchoolYearId || !fromGradeLevelId || !toGradeLevelId) {
     return res.status(400).json({ error: 'From/To school year and From/To grade are required' });
@@ -1161,7 +1521,7 @@ app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('sch
 // grade and teacher aren't separate inputs, they're just whatever the
 // destination class already is, so there's no way to pick a grade that
 // doesn't match the teacher you picked.
-app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('school_admin'), audited('PROMOTION_RUN', (req, body) => ({ details: { type: 'by-class', ...req.body, promoted: body?.promoted, skipped: body?.skipped } })), asyncRoute(async (req, res) => {
   const { fromClassId, toClassId, teacherUserId } = req.body;
   if (!fromClassId || !toClassId) return res.status(400).json({ error: 'fromClassId and toClassId are required' });
   const fromClass = await db.prepare('SELECT id, school_year_id AS "schoolYearId" FROM classes WHERE id=? AND school_id=?').get(fromClassId, req.school.id);
@@ -1209,7 +1569,7 @@ app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('sch
 // from promoting individual classes, so an admin can promote classes
 // one grade at a time without the school's current year flipping out
 // from under the classes not promoted yet.
-app.post('/api/admin/school-years/:id/activate', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+app.post('/api/admin/school-years/:id/activate', requireAuth, requireSchoolAccess('school_admin'), audited('SCHOOL_YEAR_ACTIVATED', req => ({ targetType: 'school_year', targetId: req.params.id })), asyncRoute(async (req, res) => {
   const year = await db.prepare('SELECT id, status FROM school_years WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
   if (!year) return res.status(404).json({ error: 'School year not found' });
   if (year.status !== 'PLANNING') return res.status(400).json({ error: 'Only a year that is still in planning can be activated' });
@@ -1289,17 +1649,23 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
       // never gets to broadcast.
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_staff_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
         .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'STAFF', targetStaffUserId);
-    } else {
-      // Otherwise: a note to the school office — there's no audience
-      // choice to make here, every other targetType value means ADMIN.
+    } else if (targetType === 'ADMIN') {
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
         .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'ADMIN');
+    } else {
+      // Do not silently reinterpret a forged/unknown audience as an admin
+      // message. In particular, a parent-supplied PARENT target must never
+      // create a parent-to-parent message.
+      return res.status(400).json({ error: 'Parents can only message one of their children\'s teachers or the school admin.' });
     }
     return res.status(204).end();
   }
 
-  const adminMemberships = await getMemberships(req.user.id);
-  const membership = adminMemberships.find(m => ['school_admin', 'platform_super_admin', 'staff'].includes(m.role));
+  // Admins/staff send from the school they're working in (X-School-ID —
+  // a district admin may cover several), else their first school.
+  const requestedSchoolId = req.headers['x-school-id'];
+  const adminMemberships = (await getMemberships(req.user.id)).filter(m => [...SCHOOL_ADMIN_ROLES, 'staff'].includes(m.role));
+  const membership = adminMemberships.find(m => !requestedSchoolId || m.schoolId === requestedSchoolId);
   if (!membership) return res.status(403).json({ error: 'Only a teacher, admin, or staff member can send notices.' });
 
   if (targetType === 'PARENT') {
@@ -1403,24 +1769,34 @@ app.get('/api/admin/notices', requireAuth, requireSchoolAccess('school_admin', '
 // off/pick up and see everything the inviter can. The admin is
 // notified (see /api/admin/notices) since this grants real pickup
 // access without any admin approval step existing yet.
-app.post('/api/me/guardians', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+// A parent asks for another adult (the other parent, a grandparent, a
+// sitter) to be authorized for their children. Nothing is granted here:
+// this only files a PENDING request per child — for children this parent
+// is allowed to manage (can_manage) — and an admin approves or rejects
+// it from Families → Pending Approvals. Until then the adult has no
+// student_guardians link, so they can't see the children or request a
+// drop-off/pickup. An account is created for them now (if they don't
+// already have one) so the parent can hand over the sign-in details.
+// Approved adults get pickup rights only; the admin decides at approval
+// time whether they may also add other adults.
+app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKUP_AUTHORIZATION_REQUESTED'), asyncRoute(async (req, res) => {
   const { fullName, email, phone, relationship, temporaryPassword } = req.body;
   if (!fullName?.trim() || !email?.trim() || !relationship?.trim() || !temporaryPassword) {
     return res.status(400).json({ error: 'Name, email, relationship, and a temporary password are required' });
   }
+  if (String(temporaryPassword).length < 8) return res.status(400).json({ error: 'The temporary password must be at least 8 characters' });
   const myGuardian = await db.prepare('SELECT id FROM guardians WHERE user_id=?').get(req.user.id);
   if (!myGuardian) return res.status(403).json({ error: 'No guardian profile found for this account' });
   const membership = (await getMemberships(req.user.id)).find(m => m.role === 'parent');
   if (!membership) return res.status(403).json({ error: 'No active parent membership' });
   const myLinks = await db.prepare(`
-    SELECT sg.student_id AS "studentId", sg.can_pick_up AS "canPickUp", sg.can_manage AS "canManage",
-      s.first_name || ' ' || s.last_name AS "fullName"
+    SELECT sg.student_id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName"
     FROM student_guardians sg JOIN students s ON s.id=sg.student_id
-    WHERE sg.guardian_id=? AND s.school_id=? AND s.status='ACTIVE'`).all(myGuardian.id, membership.schoolId);
-  if (myLinks.length === 0) return res.status(400).json({ error: "You don't have any children linked to this account yet." });
+    WHERE sg.guardian_id=? AND sg.can_manage=1 AND s.school_id=? AND s.status='ACTIVE'`).all(myGuardian.id, membership.schoolId);
+  if (myLinks.length === 0) return res.status(403).json({ error: "You aren't allowed to add adults for any children on this account. Please contact the school." });
 
   try {
-    const guardianId = await withTransaction(async () => {
+    const result = await withTransaction(async () => {
       let user = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
       let guardianId;
       if (user) {
@@ -1433,24 +1809,263 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), asyncRoute(asy
           .run(user.id, fullName.trim(), email.trim(), phone?.trim() || null, passwordHash(temporaryPassword));
         await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?)').run(guardianId, user.id);
       }
+      if (guardianId === myGuardian.id) throw new Error("That's your own account.");
       await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'parent') ON CONFLICT (user_id, school_id, COALESCE(campus_id, ''), role) DO NOTHING`)
         .run(id('membership'), user.id, membership.schoolId, membership.campusId);
-      const link = db.prepare(`
-        INSERT INTO student_guardians (student_id,guardian_id,relationship,can_pick_up,can_manage) VALUES (?,?,?,?,?)
-        ON CONFLICT(student_id,guardian_id) DO UPDATE SET relationship=excluded.relationship, can_pick_up=excluded.can_pick_up, can_manage=excluded.can_manage`);
-      for (const student of myLinks) await link.run(student.studentId, guardianId, relationship.trim(), student.canPickUp, student.canManage);
 
-      const childNames = myLinks.map(s => s.fullName).join(', ');
+      // Children this adult isn't already authorized for — re-asking for
+      // a child they're already linked to is a no-op, and a second ask
+      // while one is pending supersedes it (the old one is closed as
+      // replaced, kept for history).
+      const alreadyLinked = db.prepare('SELECT 1 FROM student_guardians WHERE student_id=? AND guardian_id=?');
+      const toRequest = [];
+      for (const child of myLinks) if (!(await alreadyLinked.get(child.studentId, guardianId))) toRequest.push(child);
+      if (toRequest.length === 0) throw new Error(`${fullName.trim()} is already authorized for your children.`);
+
+      const batchId = id('guardianrequest');
+      await db.prepare(`UPDATE guardian_requests SET status='REJECTED', decided_by_user_id=?, decided_at=${NOW_UTC}, decision_note='Replaced by a newer request' WHERE guardian_id=? AND status='PENDING' AND student_id = ANY(?)`)
+        .run(req.user.id, guardianId, toRequest.map(c => c.studentId));
+      const insert = db.prepare(`INSERT INTO guardian_requests (id,batch_id,school_id,student_id,guardian_id,relationship,can_pick_up,can_manage,requested_by_user_id) VALUES (?,?,?,?,?,?,1,0,?)`);
+      for (const child of toRequest) await insert.run(id('guardianrequestitem'), batchId, membership.schoolId, child.studentId, guardianId, relationship.trim(), req.user.id);
+
+      const childNames = toRequest.map(c => c.fullName).join(', ');
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
         .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent',
-          'New guardian added', `${req.user.full_name} added ${fullName.trim()} (${relationship.trim()}) as a guardian for ${childNames}.`, 'ADMIN');
-
-      return guardianId;
+          'Guardian awaiting approval', `${req.user.full_name} asked for ${fullName.trim()} (${relationship.trim()}) to be authorized to pick up ${childNames}. Review it in Families → Pending Approvals.`, 'ADMIN');
+      return { guardianId, batchId, toRequest };
     });
-    res.status(201).json({ id: guardianId });
+    res.locals.audit = {
+      schoolId: membership.schoolId, targetType: 'guardian', targetId: result.guardianId,
+      details: { batchId: result.batchId, relationship: relationship.trim(), email: email.trim(), students: result.toRequest.map(s => ({ id: s.studentId, name: s.fullName })) },
+    };
+    res.status(201).json({ id: result.guardianId, status: 'PENDING' });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already registered' : error.message });
   }
+}));
+
+// The adults on this parent's children — already authorized ones, and
+// every request filed for them (pending, approved or rejected), so the
+// parent can see where their request stands.
+app.get('/api/me/guardians', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  const authorized = await db.prepare(`
+    SELECT gu.id AS "guardianId", u.full_name AS "fullName", sg.relationship, sg.can_pick_up AS "canPickUp",
+      s.id AS "studentId", s.first_name || ' ' || s.last_name AS "studentName"
+    FROM student_guardians mine
+    JOIN guardians me ON me.id=mine.guardian_id AND me.user_id=?
+    JOIN students s ON s.id=mine.student_id AND s.status='ACTIVE'
+    JOIN memberships pm ON pm.user_id=me.user_id AND pm.school_id=s.school_id AND pm.role='parent' AND pm.status='ACTIVE'
+    JOIN student_guardians sg ON sg.student_id=s.id AND sg.guardian_id<>me.id
+    JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id
+    ORDER BY u.full_name, s.first_name`).all(req.user.id);
+  const requests = await db.prepare(`
+    SELECT gr.batch_id AS "batchId", u.full_name AS "fullName", gr.relationship, gr.status, gr.requested_at AS "requestedAt",
+      gr.decided_at AS "decidedAt", gr.decision_note AS "decisionNote", s.first_name || ' ' || s.last_name AS "studentName"
+    FROM guardian_requests gr
+    JOIN guardians gu ON gu.id=gr.guardian_id JOIN users u ON u.id=gu.user_id
+    JOIN students s ON s.id=gr.student_id
+    WHERE gr.student_id IN (
+      SELECT sg.student_id FROM student_guardians sg JOIN guardians me ON me.id=sg.guardian_id WHERE me.user_id=?)
+    ORDER BY gr.requested_at DESC`).all(req.user.id);
+  res.json({ authorized: groupAdults(authorized, 'guardianId'), requests: groupAdults(requests, 'batchId') });
+}));
+
+// Folds one-row-per-child into one entry per adult (or per request
+// batch) with the list of children it covers.
+function groupAdults(rows, key) {
+  const byKey = new Map();
+  for (const { studentId, studentName, ...row } of rows) {
+    if (!byKey.has(row[key])) byKey.set(row[key], { ...row, students: [] });
+    byKey.get(row[key]).students.push(studentName);
+  }
+  return [...byKey.values()];
+}
+
+// Admin side of the approval flow: the school's guardian requests,
+// pending first, one entry per batch.
+app.get('/api/admin/guardian-requests', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const rows = await db.prepare(`
+    SELECT gr.batch_id AS "batchId", gr.status, gr.relationship, gr.requested_at AS "requestedAt",
+      gr.decided_at AS "decidedAt", gr.decision_note AS "decisionNote",
+      u.full_name AS "fullName", u.email, u.phone, ru.full_name AS "requestedByName", du.full_name AS "decidedByName",
+      s.first_name || ' ' || s.last_name AS "studentName"
+    FROM guardian_requests gr
+    JOIN guardians gu ON gu.id=gr.guardian_id JOIN users u ON u.id=gu.user_id
+    JOIN users ru ON ru.id=gr.requested_by_user_id
+    LEFT JOIN users du ON du.id=gr.decided_by_user_id
+    JOIN students s ON s.id=gr.student_id
+    WHERE gr.school_id=?
+    ORDER BY CASE gr.status WHEN 'PENDING' THEN 0 ELSE 1 END, gr.requested_at DESC
+    LIMIT 500`).all(req.school.id);
+  res.json(groupAdults(rows, 'batchId'));
+}));
+
+// Approve or reject a whole pending batch. Approving creates the real
+// student_guardians links (pickup rights; `canManage` lets the adult add
+// other adults too) — re-checked here that each child is still an
+// ACTIVE student of this school. Either way the requesting parent gets
+// a message with the outcome.
+async function decideGuardianRequest(req, res, approve) {
+  const pending = await db.prepare(`
+    SELECT gr.*, u.full_name AS "guardianName" FROM guardian_requests gr
+    JOIN guardians gu ON gu.id=gr.guardian_id JOIN users u ON u.id=gu.user_id
+    JOIN students s ON s.id=gr.student_id AND s.school_id=gr.school_id AND s.status='ACTIVE'
+    WHERE gr.batch_id=? AND gr.school_id=? AND gr.status='PENDING'`).all(req.params.batchId, req.school.id);
+  if (pending.length === 0) return res.status(404).json({ error: 'Request not found or already decided.' });
+  const canManage = approve && req.body.canManage ? 1 : 0;
+  const note = typeof req.body.note === 'string' && req.body.note.trim() ? req.body.note.trim().slice(0, 500) : null;
+  const first = pending[0];
+  await withTransaction(async () => {
+    for (const item of pending) {
+      if (approve) {
+        await db.prepare(`
+          INSERT INTO student_guardians (student_id,guardian_id,relationship,can_pick_up,can_manage) VALUES (?,?,?,?,?)
+          ON CONFLICT(student_id,guardian_id) DO UPDATE SET relationship=excluded.relationship, can_pick_up=excluded.can_pick_up, can_manage=excluded.can_manage`)
+          .run(item.student_id, item.guardian_id, item.relationship, item.can_pick_up, canManage);
+      }
+      await db.prepare(`UPDATE guardian_requests SET status=?, can_manage=?, decided_by_user_id=?, decided_at=${NOW_UTC}, decision_note=? WHERE id=?`)
+        .run(approve ? 'APPROVED' : 'REJECTED', canManage, req.user.id, note, item.id);
+    }
+    const outcome = approve
+      ? `${first.guardianName} has been approved and can now drop off and pick up.`
+      : `The school did not approve ${first.guardianName}.${note ? ` Note: ${note}` : ''}`;
+    await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(id('notice'), req.school.id, null, req.user.id, req.user.full_name, 'admin',
+        approve ? 'Guardian approved' : 'Guardian not approved', outcome, 'PARENT', first.requested_by_user_id);
+  });
+  res.locals.audit = {
+    targetType: 'guardian', targetId: first.guardian_id,
+    details: { batchId: req.params.batchId, studentIds: pending.map(item => item.student_id), canManage: Boolean(canManage), note },
+  };
+  res.status(204).end();
+}
+
+app.post('/api/admin/guardian-requests/:batchId/approve', requireAuth, requireSchoolAccess('school_admin'), audited('PICKUP_AUTHORIZATION_APPROVED'), asyncRoute(async (req, res) => {
+  await decideGuardianRequest(req, res, true);
+}));
+
+app.post('/api/admin/guardian-requests/:batchId/reject', requireAuth, requireSchoolAccess('school_admin'), audited('PICKUP_AUTHORIZATION_REJECTED'), asyncRoute(async (req, res) => {
+  await decideGuardianRequest(req, res, false);
+}));
+
+// ---- District (see district_memberships, tenant.js) ----------------------
+
+// A district admin's at-a-glance view of every school in their district.
+// They act inside one school at a time by picking it in the website's
+// school switcher (sent as X-School-ID).
+app.get('/api/district/overview', requireAuth, asyncRoute(async (req, res) => {
+  const schools = (await getMemberships(req.user.id)).filter(m => m.role === 'district_admin');
+  if (schools.length === 0) return res.status(403).json({ error: 'District administrator access required' });
+  const count = (sql, schoolId) => db.prepare(sql).get(schoolId).then(row => row.c);
+  const rows = await Promise.all(schools.map(async m => ({
+    schoolId: m.schoolId, schoolName: m.schoolName, schoolCode: m.schoolCode, districtName: m.districtName,
+    students: await count(`SELECT COUNT(*) AS c FROM students WHERE school_id=? AND status='ACTIVE'`, m.schoolId),
+    teachers: await count(`SELECT COUNT(*) AS c FROM memberships WHERE school_id=? AND role='teacher' AND status='ACTIVE'`, m.schoolId),
+    presentToday: await count(`SELECT COUNT(*) AS c FROM students WHERE school_id=? AND status='ACTIVE' AND pickup_status='PRESENT'`, m.schoolId),
+    pendingRequests: await count(`SELECT COUNT(*) AS c FROM queue_items WHERE school_id=? AND status='PENDING'`, m.schoolId),
+    pendingGuardianApprovals: await count(`SELECT COUNT(DISTINCT batch_id) AS c FROM guardian_requests WHERE school_id=? AND status='PENDING'`, m.schoolId),
+  })));
+  res.json(rows);
+}));
+
+// ---- Data export, deletion and retention (see dataRights.js) -------------
+// School admins only. Every export and erasure is audited.
+
+const sendJsonDownload = (res, filename, data) => {
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(data);
+};
+const fileSafe = text => String(text).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'export';
+
+app.get('/api/admin/students/:id/export', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_RECORD_EXPORTED', req => ({ targetType: 'student', targetId: req.params.id, details: null })), asyncRoute(async (req, res) => {
+  const data = await buildStudentExport(req.params.id, req.school.id);
+  if (!data) return res.status(404).json({ error: 'Student not found' });
+  sendJsonDownload(res, `student-${fileSafe(`${data.student.firstName}-${data.student.lastName}`)}-${new Date().toISOString().slice(0, 10)}.json`, data);
+}));
+
+app.get('/api/admin/export', requireAuth, requireSchoolAccess('school_admin'), audited('SCHOOL_DATA_EXPORTED', () => ({ details: null })), asyncRoute(async (req, res) => {
+  const data = await buildSchoolExport(req.school.id);
+  sendJsonDownload(res, `school-${fileSafe(data.school?.name)}-${new Date().toISOString().slice(0, 10)}.json`, data);
+}));
+
+// Removed students: still on file until restored, erased by hand, or
+// erased by the retention setting (purgeAfter says when).
+app.get('/api/admin/students/removed', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const { removedStudentRetentionDays: days } = await retentionSettings(req.school.id);
+  const rows = await db.prepare(`
+    SELECT id, first_name || ' ' || last_name AS "fullName", student_number AS "studentNumber", archived_at AS "removedAt",
+      CASE WHEN ?::int IS NULL THEN NULL ELSE to_char((archived_at::timestamp + make_interval(days => ?::int)), 'YYYY-MM-DD HH24:MI:SS') END AS "purgeAfter"
+    FROM students WHERE school_id=? AND status='ARCHIVED' ORDER BY archived_at DESC`).all(days, days, req.school.id);
+  res.json(rows);
+}));
+
+app.post('/api/admin/students/:id/restore', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_RESTORED', req => ({ targetType: 'student', targetId: req.params.id, details: null })), asyncRoute(async (req, res) => {
+  const result = await db.prepare(`UPDATE students SET status='ACTIVE', archived_at=NULL WHERE id=? AND school_id=? AND status='ARCHIVED'`).run(req.params.id, req.school.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Removed student not found' });
+  res.status(204).end();
+}));
+
+// Erase a removed student now. The admin must type the student's full
+// name to confirm — this cannot be undone.
+app.delete('/api/admin/students/:id/permanent', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const student = await db.prepare(`SELECT first_name AS "firstName", last_name AS "lastName", student_number AS "studentNumber" FROM students WHERE id=? AND school_id=? AND status='ARCHIVED'`).get(req.params.id, req.school.id);
+  if (!student) return res.status(404).json({ error: 'Only a removed student can be permanently deleted. Remove them from Students first.' });
+  const typed = String(req.body?.confirmName ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (typed !== `${student.firstName} ${student.lastName}`.toLowerCase()) return res.status(400).json({ error: "Type the student's full name exactly to confirm." });
+  const counts = await permanentlyDeleteStudent(req.params.id, req.school.id);
+  if (!counts) return res.status(404).json({ error: 'Removed student not found' });
+  await writeAudit({
+    schoolId: req.school.id, actor: req.user, actorRole: req.membership?.role, action: 'STUDENT_PERMANENTLY_DELETED',
+    targetType: 'student', targetId: req.params.id, targetLabel: deletedStudentLabel(student),
+    details: { reason: typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 500) || null : null, ...counts }, ip: req.ip,
+  });
+  res.json({ deleted: counts });
+}));
+
+app.get('/api/admin/retention', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const { removedStudentRetentionDays, queueHistoryRetentionDays } = await retentionSettings(req.school.id);
+  res.json({ removedStudentRetentionDays, queueHistoryRetentionDays, minimumDays: MIN_RETENTION_DAYS, wouldDeleteNow: await previewRetention(req.school.id) });
+}));
+
+app.patch('/api/admin/retention', requireAuth, requireSchoolAccess('school_admin'), audited('RETENTION_SETTINGS_CHANGED'), asyncRoute(async (req, res) => {
+  const parse = value => (value === null || value === '' || value === undefined ? null : Number(value));
+  const removed = parse(req.body.removedStudentRetentionDays);
+  const queue = parse(req.body.queueHistoryRetentionDays);
+  for (const value of [removed, queue]) {
+    if (value !== null && (!Number.isInteger(value) || value < MIN_RETENTION_DAYS || value > 36500)) {
+      return res.status(400).json({ error: `Retention must be a whole number of days, at least ${MIN_RETENTION_DAYS}, or empty to keep records.` });
+    }
+  }
+  await db.prepare('UPDATE schools SET removed_student_retention_days=?, queue_history_retention_days=? WHERE id=?').run(removed, queue, req.school.id);
+  res.status(204).end();
+}));
+
+app.post('/api/admin/retention/run', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  res.json(await applyRetention(req.school.id, { actor: req.user, ip: req.ip }));
+}));
+
+// The school's audit trail, newest first, for school admins only (front
+// desk staff can't see it). Keyset-paged by `before` (an entry's
+// createdAt + id) so new entries arriving mid-browse don't shift pages.
+// Optional filters: action, targetType + targetId (one student's or one
+// person's history).
+app.get('/api/admin/audit-log', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+  const where = ['school_id=?']; const params = [req.school.id];
+  if (req.query.action) { where.push('action=?'); params.push(String(req.query.action)); }
+  if (req.query.targetType && req.query.targetId) { where.push('target_type=? AND target_id=?'); params.push(String(req.query.targetType), String(req.query.targetId)); }
+  if (req.query.beforeCreatedAt && req.query.beforeId) {
+    where.push('(created_at, id) < (?, ?)'); params.push(String(req.query.beforeCreatedAt), String(req.query.beforeId));
+  }
+  const rows = await db.prepare(`
+    SELECT id, created_at AS "createdAt", actor_user_id AS "actorUserId", actor_name AS "actorName", actor_role AS "actorRole",
+      action, target_type AS "targetType", target_id AS "targetId", target_label AS "targetLabel", details, ip_address AS "ipAddress"
+    FROM audit_logs WHERE ${where.join(' AND ')}
+    ORDER BY created_at DESC, id DESC LIMIT ?`).all(...params, limit + 1);
+  const entries = rows.slice(0, limit).map(row => ({ ...row, details: row.details ? JSON.parse(row.details) : null }));
+  const actions = (await db.prepare('SELECT DISTINCT action FROM audit_logs WHERE school_id=? ORDER BY action').all(req.school.id)).map(r => r.action);
+  res.json({ entries, hasMore: rows.length > limit, actions });
 }));
 
 // Serve the built React website (run `npm run build` in frontend/
@@ -1475,6 +2090,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(port, () => {
-  console.log(`Server listening on ${port}`);
-});
+export { app };
+
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(port, () => {
+    console.log(`Server listening on ${port}`);
+  });
+  // Retention: once shortly after startup, then daily.
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  setTimeout(() => applyRetentionEverywhere(), 60 * 1000).unref();
+  setInterval(() => applyRetentionEverywhere(), DAY_MS).unref();
+}
