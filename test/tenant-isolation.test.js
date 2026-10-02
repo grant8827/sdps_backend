@@ -616,3 +616,81 @@ test('a district admin manages every school in their district and nothing outsid
   assert.equal((await apiCall('GET', '/district/overview', session.token)).status, 401);
   assert.equal(await login('district@test.local', 'password'), null);
 });
+
+test('a removed staff member can be added back, but other people\'s accounts can\'t be taken over', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const add = body => apiCall('POST', '/admin/staff', admin.token, { fullName: 'Returning Teacher', password: 'new-password-1', role: 'teacher', ...body });
+
+  const created = await add({ email: 'returning@test.local' });
+  assert.equal(created.status, 201);
+  const { id: staffId, restored } = await created.json();
+  assert.equal(restored, false);
+  // Already on staff → refused with a clear message.
+  const duplicate = await add({ email: 'returning@test.local' });
+  assert.equal(duplicate.status, 400);
+  assert.match((await duplicate.json()).error, /already on your staff/);
+
+  assert.equal((await apiCall('DELETE', `/admin/staff/${staffId}`, admin.token)).status, 204);
+  const back = await add({ email: 'RETURNING@test.local', role: 'front_desk', password: 'another-pass-2' });
+  assert.equal(back.status, 201);
+  assert.deepEqual(await back.json(), { id: staffId, restored: true });
+  assert.ok((await login('returning@test.local', 'another-pass-2'))?.token);
+  const memberships = await db.prepare(`SELECT role, status FROM memberships WHERE user_id=?`).all(staffId);
+  assert.deepEqual(memberships, [{ role: 'staff', status: 'ACTIVE' }]);
+
+  // A parent's email, or another school's staff, can't be claimed.
+  const parentEmail = await add({ email: 'parent@school.test' });
+  assert.equal(parentEmail.status, 400);
+  assert.match((await parentEmail.json()).error, /different email/);
+  assert.ok((await login('parent@school.test', 'password'))?.token, 'the parent keeps their own password');
+  const otherSchool = await add({ email: 'admin-b@test.local' });
+  assert.equal(otherSchool.status, 400);
+});
+
+test('the primary location stays; an added location can be removed and its students move to the primary', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const before = (await (await apiCall('GET', '/admin/setup', admin.token)).json()).campuses;
+  const primary = before.find(c => c.isPrimary);
+  assert.ok(primary);
+  assert.equal(before.filter(c => c.isPrimary).length, 1);
+
+  await db.prepare(`INSERT INTO campuses (id,school_id,name,created_at) VALUES ('campus-annex','school-default','Annex','2999-01-01 00:00:00')`).run();
+  await db.prepare(`INSERT INTO students (id,first_name,last_name,school_id,campus_id) VALUES ('student-annex','Annie','Annex','school-default','campus-annex')`).run();
+  const withAnnex = (await (await apiCall('GET', '/admin/setup', admin.token)).json()).campuses;
+  assert.equal(withAnnex.find(c => c.id === 'campus-annex').isPrimary, false);
+
+  assert.equal((await apiCall('DELETE', `/admin/campuses/${primary.id}`, admin.token)).status, 400);
+  const frontDesk = await login('front-desk@test.local', 'password');
+  assert.equal((await apiCall('DELETE', '/admin/campuses/campus-annex', frontDesk.token)).status, 403);
+
+  const removed = await apiCall('DELETE', '/admin/campuses/campus-annex', admin.token);
+  assert.equal(removed.status, 200);
+  assert.equal((await removed.json()).moved.students, 1);
+  assert.equal((await db.prepare(`SELECT campus_id FROM students WHERE id='student-annex'`).get()).campus_id, primary.id);
+  const after = (await (await apiCall('GET', '/admin/setup', admin.token)).json()).campuses;
+  assert.ok(after.every(c => c.id !== 'campus-annex'));
+  assert.equal((await apiCall('PATCH', '/admin/campuses/campus-annex', admin.token, { name: 'Back again' })).status, 404);
+  assert.ok(await waitForAudit(`action='LOCATION_REMOVED' AND target_id=?`, ['campus-annex']));
+});
+
+test('a suspended location refuses drop-off and pick-up until reactivated', async () => {
+  const { campus_id: campusId } = await db.prepare(`SELECT campus_id FROM students WHERE id='child-3'`).get();
+  await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE student_id='child-3' AND status='PENDING'`).run();
+  const admin = await login('admin@school.test', 'password');
+  const frontDesk = await login('front-desk@test.local', 'password');
+  assert.equal((await apiCall('POST', `/admin/campuses/${campusId}/status`, frontDesk.token, { active: false })).status, 403);
+  assert.equal((await apiCall('POST', `/admin/campuses/${campusId}/status`, admin.token, { active: false })).status, 204);
+  const setup = await (await apiCall('GET', '/admin/setup', admin.token)).json();
+  const campus = setup.campuses.find(c => c.id === campusId);
+  assert.equal(campus.status, 'SUSPENDED');
+  assert.match(campus.createdAt, /^\d{4}-\d{2}-\d{2}/);
+
+  const parent = await login('morgan@school.test', 'password');
+  const paused = await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 });
+  assert.equal(paused.status, 409);
+  assert.match((await paused.json()).error, /paused/);
+
+  assert.equal((await apiCall('POST', `/admin/campuses/${campusId}/status`, admin.token, { active: true })).status, 204);
+  assert.equal((await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 })).status, 201);
+});

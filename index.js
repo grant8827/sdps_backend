@@ -611,7 +611,7 @@ const guardianLinkQuery = db.prepare(`
   WHERE sg.student_id=? AND gu.user_id=?`);
 const studentContextQuery = db.prepare(`
   SELECT s.school_id AS "schoolId", s.campus_id AS "campusId", c.teacher_user_id AS "teacherId", e.class_id AS "classId", s.pickup_status AS "pickupStatus",
-    cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius"
+    cp.latitude, cp.longitude, cp.geofence_radius AS "geofenceRadius", cp.status AS "campusStatus"
   FROM students s
   LEFT JOIN student_enrollments e ON e.student_id=s.id
   LEFT JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
@@ -652,6 +652,9 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
   if (!context) return res.status(404).json({ error: 'Student not found.' });
   if (context.pickupStatus !== requiredStatus) {
     return res.status(409).json({ error: `This student isn't currently ${requiredStatus === 'AT_HOME' ? 'at home' : 'present'}.` });
+  }
+  if (context.campusStatus === 'SUSPENDED') {
+    return res.status(409).json({ error: 'Drop-off and pick-up are paused at this school location right now. Please contact the school.' });
   }
   if (context.latitude == null || context.longitude == null) {
     return res.status(409).json({ error: 'School location is not configured. Ask the administrator to save the campus address in School Setup.' });
@@ -974,7 +977,8 @@ app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin', 
 app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json({
     school: await db.prepare('SELECT id,name,code,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
-    campuses: await db.prepare('SELECT id,name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE school_id=? ORDER BY name').all(req.school.id),
+    campuses: await db.prepare('SELECT id,name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime",created_at AS "createdAt" FROM campuses WHERE school_id=? AND status<>\'ARCHIVED\' ORDER BY created_at, id').all(req.school.id)
+      .then(rows => rows.map((row, index) => ({ ...row, isPrimary: index === 0 }))),
     schoolYears: await db.prepare('SELECT * FROM school_years WHERE school_id=? ORDER BY starts_on DESC').all(req.school.id),
     gradeLevels: await db.prepare('SELECT id,name,sort_order AS "sortOrder",next_grade_level_id AS "nextGradeLevelId" FROM grade_levels ORDER BY sort_order').all(),
     classes: await db.prepare('SELECT id,name,room_name AS "roomName",school_year_id AS "schoolYearId",grade_level_id AS "gradeLevelId",teacher_user_id AS "teacherId",campus_id AS "campusId" FROM classes WHERE school_id=? ORDER BY name').all(req.school.id),
@@ -1052,6 +1056,40 @@ app.post('/api/admin/campuses', requireAuth, requireSchoolAccess('school_admin')
   }
 }));
 
+// The school's primary location: the first one it created (normally the
+// one made at registration). It can't be removed, and is where students
+// and classes move when another location is removed.
+const primaryCampusId = async schoolId =>
+  (await db.prepare(`SELECT id FROM campuses WHERE school_id=? AND status<>'ARCHIVED' ORDER BY created_at, id LIMIT 1`).get(schoolId))?.id ?? null;
+
+// Remove an added location. Its students, classes and staff assignments
+// move to the primary location (so every child still has a pickup area),
+// and the location is archived rather than erased so past drop-off/pickup
+// and attendance records keep pointing at it. Its name is freed for reuse.
+app.delete('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), audited('LOCATION_REMOVED', (req, body) => ({ targetType: 'campus', targetId: req.params.id, details: body?.moved ?? null })), asyncRoute(async (req, res) => {
+  const campus = await db.prepare(`SELECT id, name FROM campuses WHERE id=? AND school_id=? AND status<>'ARCHIVED'`).get(req.params.id, req.school.id);
+  if (!campus) return res.status(404).json({ error: 'Location not found' });
+  const primaryId = await primaryCampusId(req.school.id);
+  if (campus.id === primaryId) return res.status(400).json({ error: "The primary location can't be removed." });
+  const moved = await withTransaction(async () => {
+    const move = table => db.prepare(`UPDATE ${table} SET campus_id=? WHERE campus_id=? AND school_id=?`).run(primaryId, campus.id, req.school.id).then(r => r.changes);
+    const counts = { students: await move('students'), classes: await move('classes'), enrollments: await move('student_enrollments'), staffAssignments: await move('memberships') };
+    await db.prepare(`UPDATE campuses SET status='ARCHIVED', name=name || ' (removed ' || id || ')' WHERE id=?`).run(campus.id);
+    return counts;
+  });
+  res.json({ moved });
+}));
+
+// Suspend a location (drop-off/pick-up requests there are refused until
+// it's reactivated — e.g. a site closed for repairs) or reactivate it.
+// Nothing is moved or deleted.
+app.post('/api/admin/campuses/:id/status', requireAuth, requireSchoolAccess('school_admin'), audited('LOCATION_STATUS_CHANGED', req => ({ targetType: 'campus', targetId: req.params.id, details: { status: req.body.active ? 'ACTIVE' : 'SUSPENDED' } })), asyncRoute(async (req, res) => {
+  const result = await db.prepare(`UPDATE campuses SET status=? WHERE id=? AND school_id=? AND status<>'ARCHIVED'`)
+    .run(req.body.active ? 'ACTIVE' : 'SUSPENDED', req.params.id, req.school.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Location not found' });
+  res.status(204).end();
+}));
+
 app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_admin'), audited('LOCATION_UPDATED', req => ({ targetType: 'campus', targetId: req.params.id })), asyncRoute(async (req, res) => {
   const { name, address, startTime, dismissalTime, extendedTime, geofenceRadius } = req.body;
   if (address !== undefined && !address.trim()) return res.status(400).json({ error: 'Address is required — it sets up the drop-off/pick-up geofence for this location' });
@@ -1063,7 +1101,7 @@ app.patch('/api/admin/campuses/:id', requireAuth, requireSchoolAccess('school_ad
   if (geofenceRadius !== undefined && geofenceRadius !== null && geofenceRadius !== '' && !(Number(geofenceRadius) > 0)) {
     return res.status(400).json({ error: 'geofenceRadius must be a positive number of meters' });
   }
-  const current = await db.prepare('SELECT name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
+  const current = await db.prepare('SELECT name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM campuses WHERE id=? AND school_id=? AND status<>\'ARCHIVED\'').get(req.params.id, req.school.id);
   if (!current) return res.status(404).json({ error: 'Location not found' });
 
   // Re-geocode when the address actually changed, or when it hasn't but
@@ -1126,7 +1164,7 @@ app.post('/api/admin/classes', requireAuth, requireSchoolAccess('school_admin'),
   if (!year) return res.status(400).json({ error: 'That school year does not belong to this school' });
   let resolvedCampusId = campusId || null;
   if (!resolvedCampusId) {
-    resolvedCampusId = (await db.prepare('SELECT id FROM campuses WHERE school_id=? ORDER BY name LIMIT 1').get(req.school.id))?.id || null;
+    resolvedCampusId = await primaryCampusId(req.school.id);
   }
   try {
     const classId = id('class');
@@ -1236,6 +1274,35 @@ app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'st
   res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
 }));
 
+// Adding someone whose email already has an account. Allowed only for a
+// former staff member of THIS school who isn't active anywhere else
+// (not a parent, not at another school, not a district admin) — so an
+// admin can never take over someone else's account by typing its email.
+// They come back with the role, password and photo the admin just
+// entered; two-step verification is cleared so they set it up again,
+// and any old sessions are ended.
+async function restoreFormerStaff(userId, schoolId, { fullName, password, photoUrl, roleConfig, campusId }) {
+  const staffRoles = ['teacher', 'school_admin', 'staff'];
+  const here = await db.prepare(`SELECT id, status FROM memberships WHERE user_id=? AND school_id=? AND role = ANY(?) ORDER BY status='ACTIVE' DESC`).all(userId, schoolId, staffRoles);
+  if (here.length === 0) {
+    throw new Error('That email already belongs to another account (for example a parent, or staff at another school). Use a different email address.');
+  }
+  if (here.some(m => m.status === 'ACTIVE')) throw new Error('This person is already on your staff list. Use Reactivate or edit them there.');
+  const activeElsewhere = await db.prepare(`
+    SELECT 1 FROM memberships WHERE user_id=? AND status='ACTIVE' AND NOT (school_id=? AND role = ANY(?))
+    UNION ALL SELECT 1 FROM district_memberships WHERE user_id=? AND status='ACTIVE' LIMIT 1`).get(userId, schoolId, staffRoles, userId);
+  if (activeElsewhere) throw new Error('That email already belongs to an active account elsewhere. Use a different email address.');
+
+  const [keep, ...others] = here;
+  for (const other of others) await db.prepare('DELETE FROM memberships WHERE id=?').run(other.id);
+  await db.prepare(`UPDATE memberships SET status='ACTIVE', role=?, campus_id=? WHERE id=?`).run(roleConfig.membershipRole, campusId, keep.id);
+  await db.prepare(`
+    UPDATE users SET full_name=?, password_hash=?, role=?, active=1, photo_url=COALESCE(?, photo_url),
+      mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL
+    WHERE id=?`).run(fullName.trim(), passwordHash(password), roleConfig.userRole, photoUrl, userId);
+  await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(userId);
+}
+
 app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_CREATED', (req, body) => ({ targetType: 'user', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { fullName, email, password, photoDataUrl, classId, role } = req.body;
   const roleConfig = STAFF_ROLES[role];
@@ -1254,9 +1321,12 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
     if (!assignedClass) return res.status(400).json({ error: 'That classroom does not belong to this school' });
   }
   try {
-    const userId = await withTransaction(async () => {
-      if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
-        throw new Error('An account with this email already exists.');
+    const { userId, restored } = await withTransaction(async () => {
+      const existing = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
+      if (existing) {
+        await restoreFormerStaff(existing.id, req.school.id, { fullName, password, photoUrl, roleConfig, campusId: assignedClass?.campusId || null });
+        if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(existing.id, assignedClass.id);
+        return { userId: existing.id, restored: true };
       }
       const userId = id('staff');
       await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,photo_url,role) VALUES (?,?,?,?,?,?)`)
@@ -1264,9 +1334,13 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
       await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?,?)`)
         .run(id('membership'), userId, req.school.id, assignedClass?.campusId || null, roleConfig.membershipRole);
       if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
-      return userId;
+      return { userId, restored: false };
     });
-    res.status(201).json({ id: userId });
+    if (restored) {
+      await endAllSessions(userId);
+      res.locals.audit = { details: { role, email: email.trim(), classId: assignedClass?.id ?? null, returningStaff: true } };
+    }
+    res.status(201).json({ id: userId, restored });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
