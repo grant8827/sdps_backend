@@ -633,7 +633,12 @@ test('a removed staff member can be added back, but other people\'s accounts can
   assert.equal((await apiCall('DELETE', `/admin/staff/${staffId}`, admin.token)).status, 204);
   const back = await add({ email: 'RETURNING@test.local', role: 'front_desk', password: 'another-pass-2' });
   assert.equal(back.status, 201);
-  assert.deepEqual(await back.json(), { id: staffId, restored: true });
+  const backBody = await back.json();
+  assert.equal(backBody.id, staffId);
+  assert.equal(backBody.restored, true);
+  // No email server in tests, so the link comes back for the admin to pass on.
+  assert.equal(backBody.emailSent, false);
+  assert.match(backBody.setupLink, /\/set-password\?token=/);
   assert.ok((await login('returning@test.local', 'another-pass-2'))?.token);
   const memberships = await db.prepare(`SELECT role, status FROM memberships WHERE user_id=?`).all(staffId);
   assert.deepEqual(memberships, [{ role: 'staff', status: 'ACTIVE' }]);
@@ -693,4 +698,83 @@ test('a suspended location refuses drop-off and pick-up until reactivated', asyn
 
   assert.equal((await apiCall('POST', `/admin/campuses/${campusId}/status`, admin.token, { active: true })).status, 204);
   assert.equal((await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 })).status, 201);
+});
+
+test('new accounts choose their own password through an emailed invite link', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const created = await apiCall('POST', '/admin/staff', admin.token, { fullName: 'Invited Teacher', email: 'invited@test.local', role: 'teacher' });
+  assert.equal(created.status, 201);
+  const { id: userId, emailSent, setupLink } = await created.json();
+  assert.equal(emailSent, false);
+  const token = new URL(setupLink).searchParams.get('token');
+  assert.ok(token);
+  const stored = await db.prepare('SELECT token_hash, purpose FROM account_links WHERE user_id=?').get(userId);
+  assert.equal(stored.purpose, 'INVITE');
+  assert.notEqual(stored.token_hash, token, 'only a hash of the token is stored');
+  assert.equal((await db.prepare('SELECT needs_password_setup FROM users WHERE id=?').get(userId)).needs_password_setup, 1);
+
+  const check = await apiCall('POST', '/auth/account-link', null, { token });
+  assert.equal(check.status, 200);
+  assert.deepEqual(await check.json(), { purpose: 'INVITE', fullName: 'Invited Teacher', email: 'invited@test.local' });
+
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token, password: 'short' })).status, 400);
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token: 'not-a-real-token', password: 'chosen-password-1' })).status, 404);
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token, password: 'chosen-password-1' })).status, 200);
+  assert.ok((await login('invited@test.local', 'chosen-password-1'))?.token);
+  assert.equal((await db.prepare('SELECT needs_password_setup FROM users WHERE id=?').get(userId)).needs_password_setup, 0);
+  // A link works once.
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token, password: 'other-password-2' })).status, 404);
+  assert.equal((await apiCall('POST', '/auth/account-link', null, { token })).status, 404);
+  assert.ok(await waitForAudit(`action='ACCOUNT_SET_UP' AND target_id=?`, [userId]));
+});
+
+test('forgot password never reveals whether an email is registered, and a reset link signs out old sessions', async () => {
+  const { createAccountLink } = await import('../accountLinks.js');
+  const known = await apiCall('POST', '/auth/forgot-password', null, { email: 'jordan@school.test' });
+  const unknown = await apiCall('POST', '/auth/forgot-password', null, { email: 'nobody-here@test.local' });
+  assert.equal(known.status, 200);
+  assert.deepEqual(await known.json(), await unknown.json());
+  assert.equal((await apiCall('POST', '/auth/forgot-password', null, { email: 'not-an-email' })).status, 400);
+  assert.ok(await waitForAudit(`action='PASSWORD_RESET_REQUESTED' AND target_id='teacher-2'`, []));
+
+  const before = await login('jordan@school.test', 'password');
+  const link = await createAccountLink('teacher-2', 'RESET');
+  const token = new URL(link).searchParams.get('token');
+  // A newer link replaces the older one.
+  const newer = new URL(await createAccountLink('teacher-2', 'RESET')).searchParams.get('token');
+  assert.equal((await apiCall('POST', '/auth/account-link', null, { token })).status, 404);
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token: newer, password: 'reset-password-9' })).status, 200);
+  assert.equal(await login('jordan@school.test', 'password'), null);
+  assert.equal((await apiCall('GET', '/me/schools', before.token)).status, 401, 'old sessions end');
+  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(passwordHash('password'), 'teacher-2');
+
+  // Expired links don't work.
+  const expired = new URL(await createAccountLink('teacher-2', 'RESET', -1000)).searchParams.get('token');
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token: expired, password: 'reset-password-9' })).status, 404);
+});
+
+test('an admin can email a sign-in link only to people in their own school', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const own = await apiCall('POST', '/admin/members/teacher-1/send-link', admin.token);
+  assert.equal(own.status, 200);
+  const body = await own.json();
+  assert.equal(body.emailSent, false);
+  assert.match(body.setupLink, /set-password/);
+  assert.equal((await db.prepare(`SELECT purpose FROM account_links WHERE user_id='teacher-1' AND used_at IS NULL`).get()).purpose, 'RESET');
+  assert.equal((await apiCall('POST', '/admin/members/admin-b/send-link', admin.token)).status, 404);
+  assert.equal((await apiCall('POST', `/admin/members/${admin.user.id}/send-link`, admin.token)).status, 400);
+  const teacher = await login('teacher@school.test', 'password');
+  assert.equal((await apiCall('POST', '/admin/members/parent-1/send-link', teacher.token)).status, 403);
+});
+
+test('a parent can ask for another adult without choosing a password for them', async () => {
+  const parent = await login('parent@school.test', 'password');
+  const response = await apiCall('POST', '/me/guardians', parent.token, { fullName: 'Grandma Invite', email: 'grandma-invite@test.local', relationship: 'Grandmother' });
+  assert.equal(response.status, 201);
+  const body = await response.json();
+  assert.equal(body.status, 'PENDING');
+  assert.match(body.setupLink, /set-password/);
+  assert.ok(await waitForAudit(`action='PICKUP_AUTHORIZATION_REQUESTED' AND target_id=?`, [body.id]));
+  // Let the background "new message" emails to the office finish before the database is dropped.
+  await new Promise(resolve => setTimeout(resolve, 300));
 });

@@ -8,6 +8,11 @@ import { SCHOOL_ADMIN_ROLES, getMemberships, requireSchoolAccess } from './tenan
 import { asyncRoute } from './asyncRoute.js';
 import { audited, writeAudit } from './audit.js';
 import { MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
+import { ADMIN_RESET_TTL_MS, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
+import {
+  deliverLater, sendAddedToSchoolEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail, sendMfaResetEmail,
+  sendNoticeEmail, sendPasswordChangedEmail, sendPasswordResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
+} from './mailer.js';
 import { randomInt, timingSafeEqual } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -444,6 +449,100 @@ app.get('/api/me/schools', requireAuth, asyncRoute(async (req, res) => {
   res.json(await getMemberships(req.user.id));
 }));
 
+// ---- Account emails (accountLinks.js, mailer.js) -----------------------------
+//
+// New accounts never get a password by email: they get an INVITE link to
+// choose their own. If email isn't set up, or delivery fails, the link
+// comes back in the response (`setupLink`) so whoever created the account
+// can pass it on another way; they're already trusted to create it.
+async function inviteNewAccount({ userId, to, fullName, schoolName, roleLabel, invitedBy, pendingApproval }) {
+  const link = await createAccountLink(userId, 'INVITE');
+  const { sent } = await sendInviteEmail({ to, fullName, schoolName, roleLabel, link, invitedBy, pendingApproval });
+  return sent ? { emailSent: true } : { emailSent: false, setupLink: link };
+}
+
+// The password for a new account: the one an older app version still
+// sends, or one nobody knows (the person chooses theirs via the invite).
+function initialPassword(password) {
+  if (password !== undefined && password !== null && password !== '') {
+    if (String(password).length < 8) throw new Error('Password must be at least 8 characters');
+    return { hash: passwordHash(String(password)), needsSetup: 0 };
+  }
+  return { hash: unusablePasswordHash(), needsSetup: 1 };
+}
+
+// "Forgot password?" — always the same answer whether or not the email
+// has an account (so it can't be used to find out who's registered), and
+// the email is sent after responding so timing doesn't tell either.
+// Rate-limited per address and per IP.
+const RESET_WINDOW_MS = 60 * 60 * 1000;
+const resetRequests = new Map(); // key -> { count, resetAt }
+function overResetLimit(key, max) {
+  const now = Date.now();
+  const entry = resetRequests.get(key);
+  if (!entry || entry.resetAt <= now) { resetRequests.set(key, { count: 1, resetAt: now + RESET_WINDOW_MS }); return false; }
+  entry.count += 1;
+  return entry.count > max;
+}
+setInterval(() => { const now = Date.now(); for (const [key, entry] of resetRequests) if (entry.resetAt <= now) resetRequests.delete(key); }, RESET_WINDOW_MS).unref();
+
+app.post('/api/auth/forgot-password', asyncRoute(async (req, res) => {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  if (!email.includes('@') || email.length > 254) return res.status(400).json({ error: 'Enter the email address you sign in with.' });
+  res.json({ message: "If that email has an SDPMPlus account, we've sent a link to reset the password. Check your inbox (and spam folder)." });
+  const emailLimited = overResetLimit(`email:${email}`, 3);
+  const ipLimited = overResetLimit(`ip:${req.ip}`, 10);
+  if (emailLimited || ipLimited) return;
+  deliverLater(async () => {
+    const user = await db.prepare('SELECT id, full_name, email FROM users WHERE LOWER(email)=? AND active=1').get(email);
+    if (!user || !(await getMemberships(user.id)).length) return;
+    const link = await createAccountLink(user.id, 'RESET');
+    await sendPasswordResetEmail({ to: user.email, fullName: user.full_name, link });
+    await auditForUser(user, 'PASSWORD_RESET_REQUESTED', req.ip, null);
+  });
+}));
+
+// The set-password page checks its link first, to greet the person and
+// show "expired" instead of a form that can't work.
+app.post('/api/auth/account-link', asyncRoute(async (req, res) => {
+  const link = await findAccountLink(req.body.token);
+  if (!link) return res.status(404).json({ error: 'This link has expired or was already used.' });
+  res.json({ purpose: link.purpose, fullName: link.fullName, email: link.email });
+}));
+
+app.post('/api/auth/set-password', asyncRoute(async (req, res) => {
+  const password = String(req.body.password || '');
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  if (password.length > 200) return res.status(400).json({ error: 'That password is too long.' });
+  const link = await useAccountLink(req.body.token, password);
+  if (!link) return res.status(404).json({ error: 'This link has expired or was already used. Ask for a new one.' });
+  await endAllSessions(link.userId);
+  const user = { id: link.userId, full_name: link.fullName };
+  await auditForUser(user, link.purpose === 'INVITE' ? 'ACCOUNT_SET_UP' : 'PASSWORD_RESET', req.ip, null);
+  if (link.purpose === 'RESET') deliverLater(() => sendPasswordChangedEmail({ to: link.email, fullName: link.fullName }));
+  res.json({ email: link.email });
+}));
+
+// An admin emails someone at their school a fresh link: an invite if
+// they never chose a password, otherwise a reset link that lasts a day.
+app.post('/api/admin/members/:userId/send-link', requireAuth, requireSchoolAccess('school_admin'), audited('ACCOUNT_LINK_SENT', req => ({ targetType: 'user', targetId: req.params.userId })), asyncRoute(async (req, res) => {
+  const member = await db.prepare(`
+    SELECT u.id, u.full_name, u.email, u.needs_password_setup AS "needsSetup", m.role FROM users u
+    JOIN memberships m ON m.user_id=u.id AND m.school_id=? AND m.status='ACTIVE' AND m.role IN ('teacher','school_admin','staff','parent')
+    WHERE u.id=? AND u.active=1`).get(req.school.id, req.params.userId);
+  if (!member) return res.status(404).json({ error: 'That person is not an active member of this school.' });
+  if (member.id === req.user.id) return res.status(400).json({ error: 'Use "Forgot password?" on the sign-in page for your own account.' });
+  if (member.needsSetup) {
+    const roleLabel = { teacher: 'a teacher', school_admin: 'an administrator', staff: 'front desk staff', parent: 'a parent or guardian' }[member.role];
+    res.locals.audit = { details: { kind: 'INVITE' } };
+    return res.json(await inviteNewAccount({ userId: member.id, to: member.email, fullName: member.full_name, schoolName: req.school.name, roleLabel }));
+  }
+  const link = await createAccountLink(member.id, 'RESET', ADMIN_RESET_TTL_MS);
+  const { sent } = await sendPasswordResetEmail({ to: member.email, fullName: member.full_name, link, requestedByAdmin: `${req.user.full_name} at ${req.school.name}`, expiresIn: '24 hours' });
+  res.locals.audit = { details: { kind: 'RESET' } };
+  res.json(sent ? { emailSent: true } : { emailSent: false, setupLink: link });
+}));
+
 app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req => ({ targetType: 'user', targetId: req.user.id, details: null })), asyncRoute(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Current and new password are required' });
@@ -452,7 +551,8 @@ app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req
   if (!verifyPassword(currentPassword, user.password_hash).ok) {
     return res.status(401).json({ error: 'Current password is incorrect' });
   }
-  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(passwordHash(newPassword), req.user.id);
+  await db.prepare('UPDATE users SET password_hash=?, needs_password_setup=0 WHERE id=?').run(passwordHash(newPassword), req.user.id);
+  deliverLater(() => sendPasswordChangedEmail({ to: req.user.email, fullName: req.user.full_name }));
   res.status(204).end();
 }));
 
@@ -509,8 +609,9 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
       // Admins must use two-step verification, so this is normally a
       // { mfaSetupRequired, mfaToken } challenge rather than a session —
       // the new admin sets up their authenticator before landing in the dashboard.
-      return { schoolId, userId, session: await login(email.trim(), password) };
+      return { schoolId, userId, code, session: await login(email.trim(), password) };
     });
+    deliverLater(() => sendSchoolWelcomeEmail({ to: email.trim(), fullName: adminFullName.trim(), schoolName: schoolName.trim(), schoolCode: result.code }));
     res.locals.audit = {
       schoolId: result.schoolId, actor: { id: result.userId, full_name: adminFullName.trim() }, actorRole: 'school_admin',
       targetType: 'school', targetId: result.schoolId,
@@ -750,14 +851,16 @@ app.post('/api/queue/:id/approve', requireAuth, audited('QUEUE_REQUEST_ACCEPTED'
       const audit = { schoolId: item.school_id, actor: req.user, targetType: 'student', targetId: item.student_id, ip: req.ip };
       const { attempts } = await db.prepare(`UPDATE queue_items SET pickup_code_attempts=pickup_code_attempts+1 WHERE id=? RETURNING pickup_code_attempts AS attempts`).get(item.id);
       if (attempts >= MAX_PICKUP_CODE_ATTEMPTS) {
+        const lockoutNoticeId = id('notice');
         await withTransaction(async () => {
           await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL, declined_at=${NOW_UTC}, declined_by_user_id=? WHERE id=? AND status='PENDING'`).run(req.user.id, item.id);
           await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id=?`).run(item.student_id);
           await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-            .run(id('notice'), item.school_id, item.campus_id, req.user.id, req.user.full_name, req.user.role === 'teacher' ? 'teacher' : 'admin',
+            .run(lockoutNoticeId, item.school_id, item.campus_id, req.user.id, req.user.full_name, req.user.role === 'teacher' ? 'teacher' : 'admin',
               'Pickup cancelled', 'Your pickup request was cancelled because the wrong pickup code was entered too many times. Please request the pickup again from your phone.', 'PARENT', item.requested_by_user_id);
         });
         await writeAudit({ ...audit, action: 'PICKUP_CODE_LOCKED_OUT', details: { queueItemId: item.id, attempts } });
+        emailNoticeLater(lockoutNoticeId);
         return res.status(409).json({ error: 'Too many wrong codes. This pickup request has been cancelled; the parent needs to request it again.' });
       }
       await writeAudit({ ...audit, action: 'PICKUP_CODE_REJECTED', details: { queueItemId: item.id, attempts } });
@@ -1190,10 +1293,10 @@ app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 
 
 app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_CREATED', (req, body) => ({ targetType: 'user', targetId: body?.id, details: { role: 'teacher', email: req.body.email, classId: req.body.classId } })), asyncRoute(async (req, res) => {
   const { fullName, email, password, photoDataUrl, classId } = req.body;
-  if (!fullName?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  let photoUrl;
+  if (!fullName?.trim() || !email?.trim()) return res.status(400).json({ error: 'Name and email are required' });
+  let photoUrl, initial;
   try {
+    initial = initialPassword(password);
     photoUrl = normalizePhotoDataUrl(photoDataUrl); // optional — photo is never required
   } catch (error) {
     return res.status(400).json({ error: error.message });
@@ -1209,14 +1312,15 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin')
         throw new Error('An account with this email already exists.');
       }
       const userId = id('teacher');
-      await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,photo_url,role) VALUES (?,?,?,?,?,'teacher')`)
-        .run(userId, fullName.trim(), email.trim(), passwordHash(password), photoUrl);
+      await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,needs_password_setup,photo_url,role) VALUES (?,?,?,?,?,?,'teacher')`)
+        .run(userId, fullName.trim(), email.trim(), initial.hash, initial.needsSetup, photoUrl);
       await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'teacher')`)
         .run(id('membership'), userId, req.school.id, assignedClass?.campusId || null);
       if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
       return userId;
     });
-    res.status(201).json({ id: userId });
+    const invite = await inviteNewAccount({ userId, to: email.trim(), fullName: fullName.trim(), schoolName: req.school.name, roleLabel: 'a teacher' });
+    res.status(201).json({ id: userId, ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
@@ -1265,7 +1369,7 @@ const STAFF_ROLES = {
 app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
     SELECT u.id, u.full_name AS "fullName", u.email, u.photo_url AS "photoUrl", m.status, m.role,
-      (u.mfa_enabled_at IS NOT NULL) AS "mfaEnabled", c.id AS "classId", c.name AS "className"
+      (u.mfa_enabled_at IS NOT NULL) AS "mfaEnabled", (u.needs_password_setup=1) AS "needsSetup", c.id AS "classId", c.name AS "className"
     FROM memberships m
     JOIN users u ON u.id=m.user_id
     LEFT JOIN classes c ON c.teacher_user_id=u.id AND c.school_id=?
@@ -1278,9 +1382,10 @@ app.get('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin', 'st
 // former staff member of THIS school who isn't active anywhere else
 // (not a parent, not at another school, not a district admin) — so an
 // admin can never take over someone else's account by typing its email.
-// They come back with the role, password and photo the admin just
-// entered; two-step verification is cleared so they set it up again,
-// and any old sessions are ended.
+// They come back with the role and photo the admin just entered (and the
+// password, if one was given — otherwise they keep their old one and get
+// an email link to choose a new one); two-step verification is cleared
+// so they set it up again, and any old sessions are ended.
 async function restoreFormerStaff(userId, schoolId, { fullName, password, photoUrl, roleConfig, campusId }) {
   const staffRoles = ['teacher', 'school_admin', 'staff'];
   const here = await db.prepare(`SELECT id, status FROM memberships WHERE user_id=? AND school_id=? AND role = ANY(?) ORDER BY status='ACTIVE' DESC`).all(userId, schoolId, staffRoles);
@@ -1297,9 +1402,9 @@ async function restoreFormerStaff(userId, schoolId, { fullName, password, photoU
   for (const other of others) await db.prepare('DELETE FROM memberships WHERE id=?').run(other.id);
   await db.prepare(`UPDATE memberships SET status='ACTIVE', role=?, campus_id=? WHERE id=?`).run(roleConfig.membershipRole, campusId, keep.id);
   await db.prepare(`
-    UPDATE users SET full_name=?, password_hash=?, role=?, active=1, photo_url=COALESCE(?, photo_url),
+    UPDATE users SET full_name=?, password_hash=COALESCE(?, password_hash), role=?, active=1, photo_url=COALESCE(?, photo_url),
       mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL
-    WHERE id=?`).run(fullName.trim(), passwordHash(password), roleConfig.userRole, photoUrl, userId);
+    WHERE id=?`).run(fullName.trim(), password ? passwordHash(String(password)) : null, roleConfig.userRole, photoUrl, userId);
   await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(userId);
 }
 
@@ -1307,10 +1412,10 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
   const { fullName, email, password, photoDataUrl, classId, role } = req.body;
   const roleConfig = STAFF_ROLES[role];
   if (!roleConfig) return res.status(400).json({ error: 'role must be one of teacher, admin, front_desk' });
-  if (!fullName?.trim() || !email?.trim() || !password) return res.status(400).json({ error: 'Name, email, and password are required' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-  let photoUrl;
+  if (!fullName?.trim() || !email?.trim()) return res.status(400).json({ error: 'Name and email are required' });
+  let photoUrl, initial;
   try {
+    initial = initialPassword(password);
     photoUrl = normalizePhotoDataUrl(photoDataUrl); // optional — photo is never required
   } catch (error) {
     return res.status(400).json({ error: error.message });
@@ -1329,8 +1434,8 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
         return { userId: existing.id, restored: true };
       }
       const userId = id('staff');
-      await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,photo_url,role) VALUES (?,?,?,?,?,?)`)
-        .run(userId, fullName.trim(), email.trim(), passwordHash(password), photoUrl, roleConfig.userRole);
+      await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,needs_password_setup,photo_url,role) VALUES (?,?,?,?,?,?,?)`)
+        .run(userId, fullName.trim(), email.trim(), initial.hash, initial.needsSetup, photoUrl, roleConfig.userRole);
       await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?,?)`)
         .run(id('membership'), userId, req.school.id, assignedClass?.campusId || null, roleConfig.membershipRole);
       if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
@@ -1340,7 +1445,18 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
       await endAllSessions(userId);
       res.locals.audit = { details: { role, email: email.trim(), classId: assignedClass?.id ?? null, returningStaff: true } };
     }
-    res.status(201).json({ id: userId, restored });
+    const roleLabel = role === 'front_desk' ? 'front desk staff' : role === 'admin' ? 'an administrator' : 'a teacher';
+    let invite;
+    if (restored) {
+      // A returning person keeps their old password unless one was given;
+      // either way they get a link to choose a new one.
+      const link = await createAccountLink(userId, 'RESET', ADMIN_RESET_TTL_MS);
+      const { sent } = await sendPasswordResetEmail({ to: email.trim(), fullName: fullName.trim(), link, requestedByAdmin: `${req.user.full_name} at ${req.school.name}`, expiresIn: '24 hours' });
+      invite = sent ? { emailSent: true } : { emailSent: false, setupLink: link };
+    } else {
+      invite = await inviteNewAccount({ userId, to: email.trim(), fullName: fullName.trim(), schoolName: req.school.name, roleLabel });
+    }
+    res.status(201).json({ id: userId, restored, ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
@@ -1372,6 +1488,8 @@ app.post('/api/admin/staff/:id/reset-mfa', requireAuth, requireSchoolAccess('sch
     await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(req.params.id);
   });
   await endAllSessions(req.params.id);
+  const person = await db.prepare('SELECT full_name, email FROM users WHERE id=?').get(req.params.id);
+  if (person) deliverLater(() => sendMfaResetEmail({ to: person.email, fullName: person.full_name, schoolName: req.school.name, resetBy: req.user.full_name }));
   res.status(204).end();
 }));
 
@@ -1401,6 +1519,8 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
   const selectedClass = await db.prepare('SELECT campus_id FROM classes WHERE id=? AND school_id=? AND school_year_id=? AND grade_level_id=?').get(classId, req.school.id, schoolYearId, gradeLevelId);
   if (!selectedClass) return res.status(400).json({ error: 'The selected class, grade, or school year does not belong to this school' });
   let guardianId = guardian?.id;
+  let createdGuardianAccount = false;
+  let addedExistingGuardian = null;
   let photoUrl;
   try {
     photoUrl = normalizePhotoDataUrl(photoDataUrl);
@@ -1413,12 +1533,15 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
         const existing = await db.prepare(`SELECT gu.id,u.id AS user_id FROM guardians gu JOIN users u ON u.id=gu.user_id WHERE LOWER(u.email)=LOWER(?)`).get(guardian.email.trim());
         if (existing) {
           guardianId = existing.id;
-          await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'parent') ON CONFLICT (user_id, school_id, COALESCE(campus_id, ''), role) DO NOTHING`).run(id('membership'), existing.user_id, req.school.id, null);
+          const added = await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'parent') ON CONFLICT (user_id, school_id, COALESCE(campus_id, ''), role) DO NOTHING`).run(id('membership'), existing.user_id, req.school.id, null);
+          if (added.changes > 0) addedExistingGuardian = existing.user_id;
         }
         else {
-          if (!guardian.fullName?.trim() || !guardian.temporaryPassword) throw new Error('New guardian name and temporary password are required');
+          if (!guardian.fullName?.trim()) throw new Error("New guardian's name is required");
+          const initial = initialPassword(guardian.temporaryPassword);
           const userId = id('parent'); guardianId = id('guardian');
-          await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,role) VALUES (?,?,?,?,?,'parent')`).run(userId, guardian.fullName.trim(), guardian.email.trim(), guardian.phone || null, passwordHash(guardian.temporaryPassword));
+          createdGuardianAccount = userId;
+          await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,needs_password_setup,role) VALUES (?,?,?,?,?,?,'parent')`).run(userId, guardian.fullName.trim(), guardian.email.trim(), guardian.phone || null, initial.hash, initial.needsSetup);
           await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?)').run(guardianId, userId);
           await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'parent')`).run(id('membership'), userId, req.school.id, null);
         }
@@ -1433,7 +1556,14 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
       if (guardianId) await db.prepare(`INSERT INTO student_guardians (student_id,guardian_id,relationship,is_primary,can_pick_up,can_manage) VALUES (?,?,?,1,?,1)`).run(studentId, guardianId, guardian.relationship || 'Guardian', guardian.canPickUp === false ? 0 : 1);
       return studentId;
     });
-    res.status(201).json({ id: studentId });
+    let invite = {};
+    if (createdGuardianAccount) {
+      invite = await inviteNewAccount({ userId: createdGuardianAccount, to: guardian.email.trim(), fullName: guardian.fullName.trim(), schoolName: req.school.name, roleLabel: 'a parent or guardian' });
+    } else if (addedExistingGuardian) {
+      const person = await db.prepare('SELECT full_name, email FROM users WHERE id=?').get(addedExistingGuardian);
+      deliverLater(() => sendAddedToSchoolEmail({ to: person.email, fullName: person.full_name, schoolName: req.school.name, roleLabel: 'a parent or guardian' }));
+    }
+    res.status(201).json({ id: studentId, ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'Student number or guardian email already exists' : error.message });
   }
@@ -1466,7 +1596,7 @@ app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_a
 }));
 
 app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), audited('PARENT_LIST_VIEWED', (req, body) => ({ details: { parentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
-  const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.id AS "userId", u.full_name AS "fullName", u.email, u.phone, m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
+  const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.id AS "userId", u.full_name AS "fullName", u.email, u.phone, (u.needs_password_setup=1) AS "needsSetup", m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
   const children = db.prepare(`SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName" FROM student_guardians sg JOIN students s ON s.id=sg.student_id WHERE sg.guardian_id=? AND s.school_id=?`);
   const result = await Promise.all(guardians.map(async g => ({ ...g, active: g.status === 'ACTIVE', children: await children.all(g.id, req.school.id) })));
   res.json(result);
@@ -1474,24 +1604,30 @@ app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin',
 
 app.post('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin'), audited('PARENT_CREATED', (req, body) => ({ targetType: 'guardian', targetId: body?.id })), asyncRoute(async (req, res) => {
   const { fullName, email, phone, temporaryPassword } = req.body;
-  if (!fullName?.trim() || !email?.trim() || !temporaryPassword) return res.status(400).json({ error: 'Name, email, and temporary password are required' });
+  if (!fullName?.trim() || !email?.trim()) return res.status(400).json({ error: 'Name and email are required' });
   try {
-    const guardianId = await withTransaction(async () => {
-      let user = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
+    const { guardianId, created, userId, existingName } = await withTransaction(async () => {
+      let user = await db.prepare('SELECT id, full_name FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
       let guardianId;
+      let created = false;
       if (user) {
         const guardian = await db.prepare('SELECT id FROM guardians WHERE user_id=?').get(user.id);
         if (!guardian) throw new Error('This email belongs to a non-parent account');
         guardianId = guardian.id;
       } else {
+        created = true;
+        const initial = initialPassword(temporaryPassword);
         user = { id: id('parent') }; guardianId = id('guardian');
-        await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,role) VALUES (?,?,?,?,?,'parent')`).run(user.id, fullName.trim(), email.trim(), phone?.trim() || null, passwordHash(temporaryPassword));
+        await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,needs_password_setup,role) VALUES (?,?,?,?,?,?,'parent')`).run(user.id, fullName.trim(), email.trim(), phone?.trim() || null, initial.hash, initial.needsSetup);
         await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?)').run(guardianId, user.id);
       }
       await db.prepare(`INSERT INTO memberships (id,user_id,school_id,campus_id,role) VALUES (?,?,?,?, 'parent')`).run(id('membership'), user.id, req.school.id, null);
-      return guardianId;
+      return { guardianId, created, userId: user.id, existingName: user.full_name };
     });
-    res.status(201).json({ id: guardianId });
+    const invite = created
+      ? await inviteNewAccount({ userId, to: email.trim(), fullName: fullName.trim(), schoolName: req.school.name, roleLabel: 'a parent or guardian' })
+      : (deliverLater(() => sendAddedToSchoolEmail({ to: email.trim(), fullName: existingName, schoolName: req.school.name, roleLabel: 'a parent or guardian' })), {});
+    res.status(201).json({ id: guardianId, ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'Parent already belongs to this school' : error.message });
   }
@@ -1673,8 +1809,63 @@ app.get('/api/teacher/parents', requireAuth, requireRole('teacher'), asyncRoute(
     ORDER BY u.full_name`).all(req.user.id));
 }));
 
+// "You have a new message" emails. Recipients mirror who sees the notice
+// in the app (/api/me/notices, /api/staff/notices, /api/admin/notices),
+// limited to active accounts with an active membership in that school,
+// never the sender. The email carries the title only; the message stays
+// in the app behind sign-in.
+async function noticeRecipients(notice) {
+  const parentInSchool = `JOIN memberships pm ON pm.user_id=u.id AND pm.school_id=? AND pm.role='parent' AND pm.status='ACTIVE'`;
+  switch (notice.target_type) {
+    case 'PARENT':
+      return db.prepare(`SELECT u.full_name, u.email FROM users u ${parentInSchool} WHERE u.id=? AND u.active=1`).all(notice.school_id, notice.target_parent_user_id);
+    case 'CLASS':
+      return db.prepare(`
+        SELECT DISTINCT u.full_name, u.email FROM classes c
+        JOIN student_enrollments e ON e.class_id=c.id
+        JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
+        JOIN students s ON s.id=e.student_id AND s.status='ACTIVE'
+        JOIN student_guardians sg ON sg.student_id=s.id
+        JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id
+        ${parentInSchool}
+        WHERE c.teacher_user_id=? AND c.school_id=? AND u.active=1`).all(notice.school_id, notice.target_teacher_id, notice.school_id);
+    case 'SCHOOL':
+      return db.prepare(`
+        SELECT DISTINCT u.full_name, u.email FROM students s
+        JOIN student_guardians sg ON sg.student_id=s.id
+        JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id
+        ${parentInSchool}
+        WHERE s.school_id=? AND s.status='ACTIVE' AND u.active=1`).all(notice.school_id, notice.school_id);
+    case 'STAFF':
+      return db.prepare(`
+        SELECT DISTINCT u.full_name, u.email FROM memberships m JOIN users u ON u.id=m.user_id
+        WHERE m.school_id=? AND m.role IN ('teacher','school_admin','staff') AND m.status='ACTIVE' AND u.active=1
+          AND (?::text IS NULL OR u.id=?)`).all(notice.school_id, notice.target_staff_user_id, notice.target_staff_user_id);
+    case 'ADMIN':
+      return db.prepare(`
+        SELECT DISTINCT u.full_name, u.email FROM memberships m JOIN users u ON u.id=m.user_id
+        WHERE m.school_id=? AND m.role IN ('school_admin','staff') AND m.status='ACTIVE' AND u.active=1`).all(notice.school_id);
+    default:
+      return [];
+  }
+}
+
+function emailNoticeLater(noticeId) {
+  deliverLater(async () => {
+    const notice = await db.prepare('SELECT n.*, s.name AS school_name, u.email AS sender_email FROM notices n JOIN schools s ON s.id=n.school_id LEFT JOIN users u ON u.id=n.sender_user_id WHERE n.id=?').get(noticeId);
+    if (!notice) return;
+    const recipients = (await noticeRecipients(notice)).filter(r => r.email.toLowerCase() !== notice.sender_email?.toLowerCase());
+    for (const person of recipients) {
+      await sendNoticeEmail({ to: person.email, fullName: person.full_name, schoolName: notice.school_name, senderName: notice.sender_name, title: notice.title });
+    }
+  });
+}
+
 app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
   const { title, body, targetType, targetParentUserId, targetStaffUserId } = req.body;
+  // Exactly one notice is created per request; its recipients get an email once it's saved.
+  const noticeId = id('notice');
+  res.on('finish', () => { if (res.statusCode === 204) emailNoticeLater(noticeId); });
   if (!title?.trim() || !body?.trim()) return res.status(400).json({ error: 'title and body are required' });
 
   if (req.user.role === 'teacher') {
@@ -1692,13 +1883,13 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
         WHERE c.teacher_user_id=? AND gu.user_id=?`).get(req.user.id, targetParentUserId);
       if (!isMyClassParent) return res.status(403).json({ error: 'That parent is not linked to a student in your class.' });
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'PARENT', targetParentUserId);
+        .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'PARENT', targetParentUserId);
     } else if (targetType === 'ADMIN') {
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'ADMIN');
+        .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'ADMIN');
     } else {
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_teacher_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'CLASS', req.user.id);
+        .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'teacher', title.trim(), body.trim(), 'CLASS', req.user.id);
     }
     return res.status(204).end();
   }
@@ -1722,10 +1913,10 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
       // means "this one teacher", never "all staff", since a parent
       // never gets to broadcast.
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_staff_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'STAFF', targetStaffUserId);
+        .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'STAFF', targetStaffUserId);
     } else if (targetType === 'ADMIN') {
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'ADMIN');
+        .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent', title.trim(), body.trim(), 'ADMIN');
     } else {
       // Do not silently reinterpret a forged/unknown audience as an admin
       // message. In particular, a parent-supplied PARENT target must never
@@ -1749,7 +1940,7 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
       WHERE gu.user_id=? AND m.school_id=? AND m.role='parent' AND m.status='ACTIVE'`).get(targetParentUserId, membership.schoolId);
     if (!isSchoolParent) return res.status(400).json({ error: 'That parent does not belong to this school' });
     await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'PARENT', targetParentUserId);
+      .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'PARENT', targetParentUserId);
   } else if (targetType === 'STAFF') {
     let staffUserId = null;
     if (targetStaffUserId) {
@@ -1759,10 +1950,10 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
       staffUserId = targetStaffUserId;
     }
     await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_staff_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'STAFF', staffUserId);
+      .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'STAFF', staffUserId);
   } else {
     await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
-      .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'SCHOOL');
+      .run(noticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'admin', title.trim(), body.trim(), 'SCHOOL');
   }
   res.status(204).end();
 }));
@@ -1855,10 +2046,11 @@ app.get('/api/admin/notices', requireAuth, requireSchoolAccess('school_admin', '
 // time whether they may also add other adults.
 app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKUP_AUTHORIZATION_REQUESTED'), asyncRoute(async (req, res) => {
   const { fullName, email, phone, relationship, temporaryPassword } = req.body;
-  if (!fullName?.trim() || !email?.trim() || !relationship?.trim() || !temporaryPassword) {
-    return res.status(400).json({ error: 'Name, email, relationship, and a temporary password are required' });
+  if (!fullName?.trim() || !email?.trim() || !relationship?.trim()) {
+    return res.status(400).json({ error: 'Name, email, and relationship are required' });
   }
-  if (String(temporaryPassword).length < 8) return res.status(400).json({ error: 'The temporary password must be at least 8 characters' });
+  let initial;
+  try { initial = initialPassword(temporaryPassword); } catch (error) { return res.status(400).json({ error: error.message }); }
   const myGuardian = await db.prepare('SELECT id FROM guardians WHERE user_id=?').get(req.user.id);
   if (!myGuardian) return res.status(403).json({ error: 'No guardian profile found for this account' });
   const membership = (await getMemberships(req.user.id)).find(m => m.role === 'parent');
@@ -1869,18 +2061,21 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
     WHERE sg.guardian_id=? AND sg.can_manage=1 AND s.school_id=? AND s.status='ACTIVE'`).all(myGuardian.id, membership.schoolId);
   if (myLinks.length === 0) return res.status(403).json({ error: "You aren't allowed to add adults for any children on this account. Please contact the school." });
 
+  const adminNoticeId = id('notice');
   try {
     const result = await withTransaction(async () => {
       let user = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
       let guardianId;
+      let created = false;
       if (user) {
         const guardian = await db.prepare('SELECT id FROM guardians WHERE user_id=?').get(user.id);
         if (!guardian) throw new Error('This email belongs to a non-parent account');
         guardianId = guardian.id;
       } else {
+        created = true;
         user = { id: id('parent') }; guardianId = id('guardian');
-        await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,role) VALUES (?,?,?,?,?,'parent')`)
-          .run(user.id, fullName.trim(), email.trim(), phone?.trim() || null, passwordHash(temporaryPassword));
+        await db.prepare(`INSERT INTO users (id,full_name,email,phone,password_hash,needs_password_setup,role) VALUES (?,?,?,?,?,?,'parent')`)
+          .run(user.id, fullName.trim(), email.trim(), phone?.trim() || null, initial.hash, initial.needsSetup);
         await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?)').run(guardianId, user.id);
       }
       if (guardianId === myGuardian.id) throw new Error("That's your own account.");
@@ -1904,15 +2099,22 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
 
       const childNames = toRequest.map(c => c.fullName).join(', ');
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
-        .run(id('notice'), membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent',
+        .run(adminNoticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent',
           'Guardian awaiting approval', `${req.user.full_name} asked for ${fullName.trim()} (${relationship.trim()}) to be authorized to pick up ${childNames}. Review it in Families → Pending Approvals.`, 'ADMIN');
-      return { guardianId, batchId, toRequest };
+      return { guardianId, batchId, toRequest, created, userId: user.id };
     });
     res.locals.audit = {
       schoolId: membership.schoolId, targetType: 'guardian', targetId: result.guardianId,
       details: { batchId: result.batchId, relationship: relationship.trim(), email: email.trim(), students: result.toRequest.map(s => ({ id: s.studentId, name: s.fullName })) },
     };
-    res.status(201).json({ id: result.guardianId, status: 'PENDING' });
+    const invite = result.created
+      ? await inviteNewAccount({
+        userId: result.userId, to: email.trim(), fullName: fullName.trim(), schoolName: membership.schoolName,
+        roleLabel: `a trusted adult (${relationship.trim()})`, invitedBy: req.user.full_name, pendingApproval: true,
+      })
+      : {};
+    emailNoticeLater(adminNoticeId);
+    res.status(201).json({ id: result.guardianId, status: 'PENDING', ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already registered' : error.message });
   }
@@ -2012,6 +2214,23 @@ async function decideGuardianRequest(req, res, approve) {
     details: { batchId: req.params.batchId, studentIds: pending.map(item => item.student_id), canManage: Boolean(canManage), note },
   };
   res.status(204).end();
+
+  // Emails after responding: the parent who asked hears the outcome, and
+  // an approved adult hears they're good to go (with a set-up link if
+  // they never chose a password).
+  deliverLater(async () => {
+    const people = db.prepare('SELECT u.id, u.full_name, u.email, u.needs_password_setup AS "needsSetup" FROM users u WHERE u.id=? AND u.active=1');
+    const requester = await people.get(first.requested_by_user_id);
+    if (requester) {
+      await sendGuardianDecisionEmail({ to: requester.email, fullName: requester.full_name, schoolName: req.school.name, adultName: first.guardianName, approved: approve, note });
+    }
+    if (!approve) return;
+    const adultUser = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(first.guardian_id);
+    const adult = adultUser && await people.get(adultUser.user_id);
+    if (!adult) return;
+    const link = adult.needsSetup ? await createAccountLink(adult.id, 'INVITE') : null;
+    await sendGuardianApprovedEmail({ to: adult.email, fullName: adult.full_name, schoolName: req.school.name, link });
+  });
 }
 
 app.post('/api/admin/guardian-requests/:batchId/approve', requireAuth, requireSchoolAccess('school_admin'), audited('PICKUP_AUTHORIZATION_APPROVED'), asyncRoute(async (req, res) => {
@@ -2169,6 +2388,9 @@ export { app };
 if (process.env.NODE_ENV !== 'test') {
   app.listen(port, () => {
     console.log(`Server listening on ${port}`);
+    verifyEmailConnection()
+      .then(() => console.log(`SMTP connection verified (${process.env.SMTP_HOST}:${process.env.SMTP_PORT}).`))
+      .catch(error => console.error(`SMTP connection failed: ${error?.message || error}`));
   });
   // Retention: once shortly after startup, then daily.
   const DAY_MS = 24 * 60 * 60 * 1000;

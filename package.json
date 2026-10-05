@@ -7,10 +7,13 @@
     "start": "node --env-file-if-exists=.env index.js",
     "dev": "node --env-file-if-exists=.env node_modules/nodemon/bin/nodemon.js index.js",
     "test": "node --env-file-if-exists=.env --test --test-isolation=none",
-    "district": "node --env-file-if-exists=.env scripts/district.js"
+    "district": "node --env-file-if-exists=.env scripts/district.js",
+    "reset-password": "node --env-file-if-exists=.env scripts/reset-password.js",
+    "email:test": "node --env-file-if-exists=.env scripts/smtp-check.js"
   },
   "dependencies": {
     "express": "^4.18.2",
+    "nodemailer": "^7.0.13",
     "pg": "^8.23.0"
   },
   "devDependencies": {

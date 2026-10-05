@@ -206,6 +206,10 @@ async function seedDemoData() {
   await enroll.run('enrollment-1', 'child-1', 'year-current', 'grade-2', 'class-1');
   await enroll.run('enrollment-2', 'child-2', 'year-current', 'grade-2', 'class-1');
   await enroll.run('enrollment-3', 'child-3', 'year-current', 'grade-3', 'class-2');
+  // Turning SEED_DEMO_DATA back on re-enables demo accounts that an
+  // earlier start (with it off) deactivated — the inserts above skip
+  // rows that already exist, so they wouldn't otherwise come back.
+  await pool.query(`UPDATE users SET active=1 WHERE id = ANY($1) AND email LIKE '%@school.test' AND active=0`, [DEMO_USER_IDS]);
 }
 
 async function deactivateDemoAccounts() {
