@@ -208,6 +208,21 @@ test('responses carry security headers', async () => {
   assert.match(response.headers.get('content-security-policy'), /frame-ancestors 'none'/);
 });
 
+test('production website can preflight cross-origin API requests', async () => {
+  const response = await fetch(`${apiBaseUrl}/api/auth/forgot-password`, {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'https://www.sdpmplus.com',
+      'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'content-type',
+    },
+  });
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get('access-control-allow-origin'), 'https://www.sdpmplus.com');
+  assert.match(response.headers.get('access-control-allow-methods'), /POST/);
+  assert.match(response.headers.get('access-control-allow-headers'), /Content-Type/i);
+});
+
 // Audit entries are written once the response has finished, so give
 // the write a moment to land before asserting on it.
 async function waitForAudit(where, params) {
