@@ -793,3 +793,740 @@ test('a parent can ask for another adult without choosing a password for them', 
   // Let the background "new message" emails to the office finish before the database is dropped.
   await new Promise(resolve => setTimeout(resolve, 300));
 });
+
+// ---- Phase 1: platform administration ------------------------------------------------
+
+async function addPlatformAdmin(userId, role) {
+  await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,role) VALUES (?,?,?,?,'admin')`).run(userId, `Platform ${role}`, `${userId}@test.local`, passwordHash('password'));
+  await db.prepare(`INSERT INTO platform_admins (user_id,role) VALUES (?,?)`).run(userId, role);
+  return login(`${userId}@test.local`, 'password');
+}
+
+test('a School B admin cannot read or change any School A record by id, however the school is named', async () => {
+  const adminB = await login('admin-b@test.local', 'password');
+  const { id: campusA } = await db.prepare(`SELECT id FROM campuses WHERE school_id='school-default' ORDER BY created_at LIMIT 1`).get();
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id) VALUES ('queue-a','school-default','child-1','PICK_UP','parent-1')`).run();
+  const before = await db.prepare(`SELECT status, pickup_status FROM students WHERE id='child-1'`).get();
+
+  const attempts = [
+    ['GET', '/admin/students/child-1/export'],
+    ['PATCH', '/admin/students/child-1', { status: 'SUSPENDED' }],
+    ['DELETE', '/admin/students/child-1'],
+    ['POST', '/admin/students/child-1/restore'],
+    ['DELETE', '/admin/students/child-1/permanent', { confirmName: 'x' }],
+    ['POST', '/admin/students/child-1/guardians', { guardianId: 'guardian-1' }],
+    ['PATCH', '/admin/guardians/guardian-1', { active: false }],
+    ['DELETE', '/admin/guardians/guardian-1'],
+    ['PATCH', '/admin/staff/teacher-1', { active: false }],
+    ['POST', '/admin/staff/teacher-1/reset-mfa'],
+    ['DELETE', '/admin/staff/teacher-1'],
+    ['PATCH', '/admin/teachers/teacher-1', { fullName: 'Taken Over' }],
+    ['POST', '/admin/members/parent-1/send-link'],
+    ['POST', '/attendance', { studentId: 'child-1', date: '2026-01-05', status: 'ABSENT' }],
+    ['GET', '/admin/attendance?classId=class-1'],
+    ['POST', '/queue/queue-a/approve', { overrideReason: 'trying' }],
+    ['POST', '/queue/queue-a/decline'],
+    ['PATCH', `/admin/campuses/${campusA}`, { name: 'Taken' }],
+  ];
+  // As themselves, then claiming School A by header, query string and body.
+  for (const [method, path, body] of attempts) {
+    for (const variant of ['own', 'header', 'query', 'body']) {
+      const url = variant === 'query' ? `${path}${path.includes('?') ? '&' : '?'}schoolId=school-default` : path;
+      const response = await fetch(`${apiBaseUrl}/api${url}`, {
+        method,
+        headers: { Authorization: `Bearer ${adminB.token}`, 'Content-Type': 'application/json', ...(variant === 'header' ? { 'X-School-ID': 'school-default' } : {}) },
+        body: method === 'GET' ? undefined : JSON.stringify({ ...(body ?? {}), ...(variant === 'body' ? { schoolId: 'school-default' } : {}) }),
+      });
+      if (method === 'GET' && response.ok) {
+        // A list read may succeed, but only ever with the caller's own school's rows.
+        const rows = await response.json();
+        assert.ok(Array.isArray(rows) && rows.every(row => row.studentId !== 'child-1' && row.id !== 'child-1'), `${method} ${url} (${variant}) leaked School A data`);
+      } else {
+        assert.ok([400, 403, 404].includes(response.status), `${method} ${url} (${variant}) returned ${response.status}`);
+      }
+    }
+  }
+  // Lists never include the other school's records either.
+  const students = await (await apiCall('GET', '/admin/students', adminB.token)).json();
+  assert.ok(students.every(s => s.id !== 'child-1'));
+  const guardians = await (await apiCall('GET', '/admin/guardians', adminB.token)).json();
+  assert.ok(guardians.every(g => g.id !== 'guardian-1'));
+
+  assert.deepEqual(await db.prepare(`SELECT status, pickup_status FROM students WHERE id='child-1'`).get(), before);
+  assert.equal((await db.prepare(`SELECT status FROM queue_items WHERE id='queue-a'`).get()).status, 'PENDING');
+  assert.equal((await db.prepare(`SELECT full_name FROM users WHERE id='teacher-1'`).get()).full_name !== 'Taken Over', true);
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE id='queue-a'`).run();
+});
+
+test('a platform role alone never opens a school, and the old super-admin membership no longer does either', async () => {
+  const superAdmin = await addPlatformAdmin('super-1', 'SUPER_ADMIN');
+  assert.ok(superAdmin.token, 'a platform admin with no school can sign in');
+  assert.equal(superAdmin.user.platform.role, 'SUPER_ADMIN');
+  for (const headers of [{}, { 'X-School-ID': 'school-b' }]) {
+    const response = await fetch(`${apiBaseUrl}/api/admin/students`, { headers: { Authorization: `Bearer ${superAdmin.token}`, ...headers } });
+    assert.equal(response.status, 403);
+  }
+  // A leftover platform_super_admin membership (the old design) is just ignored.
+  await addSchoolUser('legacy-super', 'admin', 'platform_super_admin');
+  const legacy = await login('legacy-super@test.local', 'password');
+  for (const headers of [{}, { 'X-School-ID': 'school-b' }, { 'X-School-ID': 'school-default' }]) {
+    const response = await fetch(`${apiBaseUrl}/api/admin/students`, { headers: { Authorization: `Bearer ${legacy.token}`, ...headers } });
+    assert.equal(response.status, 403, 'a legacy super-admin membership grants no school access');
+  }
+  assert.equal((await apiCall('GET', '/superadmin/me', legacy.token)).status, 403);
+  // ...and the platform's own API is closed to school staff.
+  const schoolAdmin = await login('admin@school.test', 'password');
+  for (const path of ['/superadmin/me', '/superadmin/schools', '/superadmin/audit-logs', '/superadmin/admins']) {
+    assert.equal((await apiCall('GET', path, schoolAdmin.token)).status, 403, path);
+  }
+  assert.equal((await apiCall('POST', '/superadmin/support-sessions', schoolAdmin.token, { schoolId: 'school-b', reason: 'curious' })).status, 403);
+});
+
+test('each platform role can do only what its permissions allow', async () => {
+  const billing = await addPlatformAdmin('billing-1', 'BILLING_ADMIN');
+  const support = await addPlatformAdmin('support-1', 'SUPPORT_ADMIN');
+  assert.deepEqual((await (await apiCall('GET', '/superadmin/me', billing.token)).json()).role, 'BILLING_ADMIN');
+  assert.equal((await apiCall('GET', '/superadmin/schools', billing.token)).status, 200);
+  assert.equal((await apiCall('GET', '/superadmin/audit-logs', billing.token)).status, 403);
+  assert.equal((await apiCall('POST', '/superadmin/schools/school-b/suspend', billing.token, { reason: 'Billing test only' })).status, 403);
+  assert.equal((await apiCall('POST', '/superadmin/support-sessions', billing.token, { schoolId: 'school-b', reason: 'Billing question' })).status, 403);
+  assert.equal((await apiCall('GET', '/superadmin/audit-logs', support.token)).status, 200);
+  assert.equal((await apiCall('POST', '/superadmin/schools', support.token, { name: 'Nope', adminFullName: 'X', adminEmail: 'nope@test.local' })).status, 403);
+  assert.equal((await apiCall('GET', '/superadmin/admins', support.token)).status, 403);
+  // Responses never carry secrets.
+  const body = await (await apiCall('GET', '/superadmin/schools/school-b', support.token)).text();
+  assert.doesNotMatch(body, /password|scrypt\$|mfa_secret|token_hash/i);
+});
+
+test('platform admins must use two-step verification', async () => {
+  process.env.REQUIRE_ADMIN_MFA = 'true';
+  try {
+    const result = await login('support-1@test.local', 'password');
+    assert.equal(result.mfaSetupRequired, true);
+    assert.equal(result.token, undefined);
+  } finally {
+    process.env.REQUIRE_ADMIN_MFA = 'false';
+  }
+});
+
+test('a support session needs a reason, stays in one school, is read-only, audited, and ends', async () => {
+  const support = await login('support-1@test.local', 'password');
+  const start = body => apiCall('POST', '/superadmin/support-sessions', support.token, body);
+  assert.equal((await start({ schoolId: 'school-b' })).status, 400, 'reason required');
+  assert.equal((await start({ schoolId: 'school-b', reason: 'Parent cannot see child', allowChanges: true })).status, 403, 'support admins are read-only');
+  const started = await start({ schoolId: 'school-b', reason: 'Parent cannot see child' });
+  assert.equal(started.status, 201);
+  const { id: sessionId } = await started.json();
+
+  const setup = await apiCall('GET', '/admin/setup', support.token);
+  assert.equal(setup.status, 200);
+  assert.equal((await setup.json()).school.name, 'School B');
+  const list = await apiCall('GET', '/admin/students', support.token);
+  assert.equal(list.status, 200);
+  assert.ok((await list.json()).every(s => s.schoolId === 'school-b'));
+  const other = await fetch(`${apiBaseUrl}/api/admin/students`, { headers: { Authorization: `Bearer ${support.token}`, 'X-School-ID': 'school-default' } });
+  assert.equal(other.status, 403, 'only the school the session is for');
+  assert.equal((await apiCall('PATCH', '/admin/students/student-b', support.token, { status: 'SUSPENDED' })).status, 403, 'read-only');
+  assert.equal((await db.prepare(`SELECT status FROM students WHERE id='student-b'`).get()).status, 'ACTIVE');
+
+  const startedEntry = await waitForAudit(`action='SUPPORT_SESSION_STARTED' AND support_session_id=?`, [sessionId]);
+  assert.equal(startedEntry.school_id, 'school-b', 'the school can see who looked in');
+  assert.equal(startedEntry.reason, 'Parent cannot see child');
+  assert.equal(startedEntry.actor_role, 'SUPPORT_ADMIN');
+  assert.ok(startedEntry.request_id);
+  assert.ok(await waitForAudit(`action='SUPPORT_VIEWED' AND support_session_id=?`, [sessionId]));
+
+  const me = await (await apiCall('GET', '/superadmin/me', support.token)).json();
+  assert.equal(me.supportSession.schoolName, 'School B');
+  assert.equal(me.supportSession.allowChanges, false);
+
+  assert.equal((await apiCall('POST', '/superadmin/support-sessions/end', support.token)).status, 204);
+  assert.equal((await apiCall('GET', '/admin/students', support.token)).status, 403);
+  assert.ok(await waitForAudit(`action='SUPPORT_SESSION_ENDED' AND support_session_id=?`, [sessionId]));
+
+  // Sessions expire on their own.
+  await start({ schoolId: 'school-b', reason: 'Checking expiry works' });
+  await db.prepare(`UPDATE support_sessions SET expires_at=? WHERE platform_user_id='support-1' AND ended_at IS NULL`).run(Date.now() - 1);
+  assert.equal((await apiCall('GET', '/admin/students', support.token)).status, 403);
+});
+
+test('a super admin can make changes in a support session only when it allows them, and each change is audited', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const started = await apiCall('POST', '/superadmin/support-sessions', superAdmin.token, { schoolId: 'school-b', reason: 'Fixing a wrong enrollment', allowChanges: true });
+  assert.equal(started.status, 201);
+  const { id: sessionId } = await started.json();
+  assert.equal((await apiCall('PATCH', '/admin/students/student-b', superAdmin.token, { status: 'SUSPENDED' })).status, 204);
+  const entry = await waitForAudit(`action='STUDENT_STATUS_CHANGED' AND support_session_id=?`, [sessionId]);
+  assert.equal(entry.actor_user_id, 'super-1');
+  assert.equal(entry.actor_role, 'SUPER_ADMIN');
+  assert.ok(await waitForAudit(`action='SUPPORT_CHANGE' AND support_session_id=?`, [sessionId]));
+  await apiCall('PATCH', '/admin/students/student-b', superAdmin.token, { status: 'ACTIVE' });
+  await apiCall('POST', '/superadmin/support-sessions/end', superAdmin.token);
+});
+
+test('suspending a school locks its users out until it is reactivated, with a reason each way', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const adminB = await login('admin-b@test.local', 'password');
+  assert.equal((await apiCall('POST', '/superadmin/schools/school-b/suspend', superAdmin.token, {})).status, 400, 'reason required');
+  await apiCall('POST', '/superadmin/support-sessions', superAdmin.token, { schoolId: 'school-b', reason: 'Looking before suspension' });
+  assert.equal((await apiCall('POST', '/superadmin/schools/school-b/suspend', superAdmin.token, { reason: 'Contract ended' })).status, 204);
+  assert.equal((await apiCall('GET', '/admin/students', adminB.token)).status, 401, 'signed in users are cut off');
+  assert.equal(await login('admin-b@test.local', 'password'), null);
+  assert.equal((await apiCall('GET', '/admin/students', superAdmin.token)).status, 403, 'support sessions into it end');
+  assert.equal((await apiCall('POST', '/superadmin/schools/school-b/archive', (await login('support-1@test.local', 'password')).token, { reason: 'Not allowed' })).status, 403);
+  const suspended = await waitForAudit(`action='SCHOOL_SUSPENDED' AND school_id='school-b'`, []);
+  assert.equal(suspended.reason, 'Contract ended');
+
+  const list = await (await apiCall('GET', '/superadmin/schools?status=SUSPENDED', superAdmin.token)).json();
+  assert.ok(list.items.some(s => s.id === 'school-b' && s.suspendedReason === 'Contract ended'));
+
+  assert.equal((await apiCall('POST', '/superadmin/schools/school-b/reactivate', superAdmin.token, { reason: 'Contract renewed' })).status, 204);
+  assert.ok((await login('admin-b@test.local', 'password'))?.token);
+  assert.ok(await waitForAudit(`action='SCHOOL_REACTIVATED' AND school_id='school-b'`, []));
+});
+
+test('a platform admin can create a school with an invited administrator, and find it', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const created = await apiCall('POST', '/superadmin/schools', superAdmin.token, { name: 'Oak Valley Elementary', campusName: 'Main', adminFullName: 'Olive Admin', adminEmail: 'olive@oakvalley.test' });
+  assert.equal(created.status, 201);
+  const { id: schoolId, setupLink } = await created.json();
+  assert.match(setupLink, /set-password/);
+  assert.equal((await apiCall('POST', '/superadmin/schools', superAdmin.token, { name: 'Again', adminFullName: 'X', adminEmail: 'olive@oakvalley.test' })).status, 400);
+
+  const found = await (await apiCall('GET', '/superadmin/schools?search=oak%20valley', superAdmin.token)).json();
+  assert.equal(found.total, 1);
+  assert.equal(found.items[0].staff, 1);
+  const detail = await (await apiCall('GET', `/superadmin/schools/${schoolId}`, superAdmin.token)).json();
+  assert.equal(detail.admins[0].email, 'olive@oakvalley.test');
+  assert.equal(detail.admins[0].needsSetup, true);
+  assert.equal(detail.setup.find(item => item.key === 'year').done, true);
+  assert.equal(detail.setup.find(item => item.key === 'students').done, false);
+  assert.ok(await waitForAudit(`action='SCHOOL_CREATED' AND school_id=?`, [schoolId]));
+
+  // Paging and sorting are bounded.
+  const pageOne = await (await apiCall('GET', '/superadmin/schools?pageSize=1&sort=name&dir=desc', superAdmin.token)).json();
+  assert.equal(pageOne.items.length, 1);
+  assert.ok(pageOne.total >= 3);
+});
+
+test('platform admins are managed by super admins, and the last super admin cannot be removed', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const added = await apiCall('POST', '/superadmin/admins', superAdmin.token, { email: 'new-platform@test.local', fullName: 'New Platform', role: 'PLATFORM_ADMIN' });
+  assert.equal(added.status, 201);
+  const { id: newId } = await added.json();
+  assert.equal((await apiCall('PATCH', `/superadmin/admins/${newId}`, superAdmin.token, { role: 'SUPPORT_ADMIN' })).status, 400, 'reason required');
+  assert.equal((await apiCall('PATCH', `/superadmin/admins/${newId}`, superAdmin.token, { role: 'SUPPORT_ADMIN', reason: 'Moved to support team' })).status, 204);
+  assert.ok(await waitForAudit(`action='ROLE_CHANGED' AND target_id=?`, [newId]));
+  assert.equal((await apiCall('PATCH', '/superadmin/admins/super-1', superAdmin.token, { status: 'DISABLED', reason: 'Trying myself' })).status, 400);
+
+  // Disabling signs them out and closes the platform API to them.
+  const support = await login('support-1@test.local', 'password');
+  assert.equal((await apiCall('PATCH', '/superadmin/admins/support-1', superAdmin.token, { status: 'DISABLED', reason: 'Left the company' })).status, 204);
+  assert.equal((await apiCall('GET', '/superadmin/me', support.token)).status, 401);
+  assert.equal(await login('support-1@test.local', 'password'), null);
+});
+
+test('the platform audit search spans schools and filters by action', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const result = await (await apiCall('GET', '/superadmin/audit-logs?action=SCHOOL_SUSPENDED', superAdmin.token)).json();
+  assert.ok(result.entries.length >= 1);
+  assert.ok(result.entries.every(e => e.action === 'SCHOOL_SUSPENDED'));
+  assert.equal(result.entries[0].schoolName, 'School B');
+  const paged = await (await apiCall('GET', '/superadmin/audit-logs?limit=2', superAdmin.token)).json();
+  assert.equal(paged.entries.length, 2);
+  const last = paged.entries[1];
+  const next = await (await apiCall('GET', `/superadmin/audit-logs?limit=2&beforeCreatedAt=${encodeURIComponent(last.createdAt)}&beforeId=${last.id}`, superAdmin.token)).json();
+  assert.ok(next.entries.every(e => e.id !== paged.entries[0].id && e.id !== last.id));
+});
+
+test('a message from another school cannot be marked read', async () => {
+  const adminB = await login('admin-b@test.local', 'password');
+  const { id: noticeA } = await db.prepare(`SELECT id FROM notices WHERE school_id='school-default' LIMIT 1`).get() ?? {};
+  if (noticeA) assert.equal((await apiCall('POST', `/notices/${noticeA}/read`, adminB.token)).status, 404);
+});
+
+// ---- Phase 2: platform dashboard, Needs Attention, school detail tabs ----------------
+
+test('the platform dashboard counts today\'s activity across schools, for platform roles only', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const before = await (await apiCall('GET', '/superadmin/dashboard?refresh=1', superAdmin.token)).json();
+  const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  const localToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,approved_at,verification_method) VALUES ('dash-pickup','school-default','child-2','PICK_UP','parent-1','APPROVED',?,'ADMIN_OVERRIDE')`).run(nowUtc);
+  await db.prepare(`INSERT INTO attendance_records (id,school_id,student_id,date,status) VALUES ('dash-att','school-b','student-b',?,'PRESENT') ON CONFLICT (student_id,date) DO NOTHING`).run(localToday);
+
+  const after = await (await apiCall('GET', '/superadmin/dashboard?refresh=1', superAdmin.token)).json();
+  assert.equal(after.operations.pickUps, before.operations.pickUps + 1);
+  assert.equal(after.operations.overrides, before.operations.overrides + 1);
+  assert.equal(after.operations.exceptions, before.operations.exceptions + 1);
+  assert.ok(after.operations.present >= 1);
+  assert.equal(after.daily.length, 30);
+  assert.equal(after.daily.at(-1).date, localToday);
+  assert.ok(after.daily.at(-1).pickUps >= 1);
+  assert.ok(after.totals.totalSchools >= 3 && after.totals.activeSchools >= 2);
+  assert.ok(after.totals.activeUsers >= 1);
+
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/dashboard', billing.token)).status, 200);
+  const schoolAdmin = await login('admin@school.test', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/dashboard', schoolAdmin.token)).status, 403);
+  assert.equal((await apiCall('GET', '/superadmin/needs-attention', schoolAdmin.token)).status, 403);
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE id='dash-pickup'`).run();
+});
+
+test('Needs Attention lists real problems with links, and says what it does not track yet', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const result = await (await apiCall('GET', '/superadmin/needs-attention', superAdmin.token)).json();
+  const ids = result.items.map(item => item.id);
+  assert.ok(ids.includes('email-not-configured'), 'no SMTP settings in tests');
+  const oakValley = (await db.prepare(`SELECT id FROM schools WHERE name='Oak Valley Elementary'`).get()).id;
+  const setup = result.items.find(item => item.id === `setup-${oakValley}`);
+  assert.ok(setup && setup.link === `/platform/schools/${oakValley}`);
+  assert.match(setup.detail, /no location mapped/);
+  assert.ok(ids.includes('locked-accounts'), 'an earlier test locked an account name');
+  assert.ok(ids.includes(`override-school-default`));
+  assert.ok(result.items.every(item => item.link === null || item.link.startsWith('/platform/')));
+  assert.equal(result.items[0].severity, 'critical');
+  assert.ok(result.notTracked.length > 0);
+  assert.doesNotMatch(JSON.stringify(result), /password_hash|scrypt\$/);
+});
+
+test('school detail tabs show people and children without credentials, and every look is audited', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const staff = await (await apiCall('GET', '/superadmin/schools/school-default/users?kind=staff&pageSize=1', superAdmin.token)).json();
+  assert.equal(staff.items.length, 1);
+  assert.ok(staff.total > 1);
+  assert.equal((await apiCall('POST', '/auth/login', null, { identifier: 'teacher@school.test', password: 'password' })).status, 200);
+  await waitForAudit(`action='SIGNED_IN' AND actor_user_id='teacher-1'`, []);
+  const allStaff = await (await apiCall('GET', '/superadmin/schools/school-default/users?kind=staff&pageSize=100', superAdmin.token)).json();
+  assert.ok(allStaff.items.some(u => u.id === 'teacher-1' && u.lastSignIn));
+  const parents = await (await apiCall('GET', '/superadmin/schools/school-default/users?kind=parents&search=parent', superAdmin.token)).json();
+  assert.ok(parents.items.every(u => u.role === 'parent'));
+  assert.ok(await waitForAudit(`action='PLATFORM_USERS_VIEWED' AND school_id='school-default' AND actor_user_id='super-1'`, []));
+
+  const studentsResponse = await apiCall('GET', '/superadmin/schools/school-default/students', superAdmin.token);
+  const studentsBody = await studentsResponse.text();
+  assert.equal(studentsResponse.status, 200);
+  assert.doesNotMatch(studentsBody, /dateOfBirth|date_of_birth|photo/i);
+  assert.ok(JSON.parse(studentsBody).items.some(s => s.id === 'child-1'));
+  assert.ok(await waitForAudit(`action='PLATFORM_STUDENTS_VIEWED' AND school_id='school-default'`, []));
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/schools/school-default/students', billing.token)).status, 403);
+  assert.equal((await apiCall('GET', '/superadmin/schools/school-default/users', billing.token)).status, 403);
+
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,pickup_code) VALUES ('ops-secret','school-default','child-3','PICK_UP','parent-1','SECRET9')`).run();
+  const ops = await (await apiCall('GET', '/superadmin/schools/school-default/operations', superAdmin.token)).text();
+  assert.doesNotMatch(ops, /SECRET9|pickup_code|pickupCode/);
+  assert.ok(JSON.parse(ops).today.pending >= 1);
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL WHERE id='ops-secret'`).run();
+
+  const attendance = await (await apiCall('GET', '/superadmin/schools/school-b/attendance', superAdmin.token)).json();
+  assert.equal(attendance.days.length, 14);
+  const security = await (await apiCall('GET', '/superadmin/schools/school-b/security', superAdmin.token)).json();
+  assert.ok(security.supportSessions.some(s => s.reason === 'Parent cannot see child'));
+  const notifications = await (await apiCall('GET', '/superadmin/schools/school-b/notifications', superAdmin.token)).json();
+  assert.equal(notifications.emailConfigured, false);
+  assert.equal((await apiCall('GET', '/superadmin/schools/no-such-school/users', superAdmin.token)).status, 404);
+});
+
+// ---- Phase 3: platform operations ----------------------------------------------------------
+
+test('live operations show each school\'s waiting requests, oldest first, with children named only as "First L."', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const fortyMinutesAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,requested_at,pickup_code) VALUES ('ops-wait-b','school-b','student-b','PICK_UP','admin-b',?,'CODE77')`).run(fortyMinutesAgo);
+
+  const schools = await (await apiCall('GET', '/superadmin/operations/schools', superAdmin.token)).json();
+  const schoolB = schools.items.find(sc => sc.id === 'school-b');
+  assert.ok(schoolB.pendingPickUps >= 1 && schoolB.oldestWaitMinutes >= 39);
+  const waits = schools.items.map(sc => sc.oldestWaitMinutes).filter(w => w !== null);
+  assert.deepEqual(waits, [...waits].sort((a, b) => b - a), 'longest wait first');
+
+  const waiting = await apiCall('GET', '/superadmin/operations/requests?state=waiting&schoolId=school-b', superAdmin.token);
+  const body = await waiting.text();
+  assert.doesNotMatch(body, /CODE77|pickup_code|Private Student/);
+  const item = JSON.parse(body).items.find(i => i.id === 'ops-wait-b');
+  assert.equal(item.studentName, 'Private S.');
+  assert.ok(item.waitMinutes >= 39);
+  const dropOffsOnly = await (await apiCall('GET', '/superadmin/operations/requests?state=waiting&type=DROP_OFF&schoolId=school-b', superAdmin.token)).json();
+  assert.ok(dropOffsOnly.items.every(i => i.requestType === 'DROP_OFF'));
+  assert.ok(await waitForAudit(`action='PLATFORM_OPERATIONS_VIEWED' AND actor_user_id='super-1'`, []));
+
+  const schoolAdmin = await login('admin@school.test', 'password');
+  for (const path of ['/superadmin/operations/schools', '/superadmin/operations/requests', '/superadmin/operations/attendance', '/superadmin/operations/incidents']) {
+    assert.equal((await apiCall('GET', path, schoolAdmin.token)).status, 403, path);
+  }
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/operations/requests', billing.token)).status, 403, 'billing admins have no pickup:view');
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL WHERE id='ops-wait-b'`).run();
+});
+
+test('attendance by school for a day counts present, late, absent and not marked', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  await db.prepare(`INSERT INTO attendance_records (id,school_id,student_id,date,status,late) VALUES ('ops-att','school-b','student-b','2026-03-02','PRESENT',1) ON CONFLICT (student_id,date) DO NOTHING`).run();
+  const result = await (await apiCall('GET', '/superadmin/operations/attendance?date=2026-03-02', superAdmin.token)).json();
+  const schoolB = result.items.find(s => s.id === 'school-b');
+  assert.equal(schoolB.present, 1);
+  assert.equal(schoolB.late, 1);
+  assert.equal(schoolB.unmarked, schoolB.students - 1);
+  assert.ok(result.totals.present >= 1);
+});
+
+test('incidents list overrides and wrong-code lockouts, and can be marked reviewed once, with a note', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,approved_at,approved_by_user_id,verification_method,override_reason) VALUES ('incident-override','school-default','child-1','PICK_UP','parent-1','APPROVED',?,'admin-1','ADMIN_OVERRIDE','Parent phone dead, ID checked')`).run(nowUtc);
+
+  const open = await (await apiCall('GET', '/superadmin/operations/incidents', superAdmin.token)).json();
+  const override = open.items.find(i => i.key === 'override:incident-override');
+  assert.ok(override);
+  assert.equal(override.reason, 'Parent phone dead, ID checked');
+  assert.match(override.studentName, /^\S+ \S\.$/);
+  assert.ok(open.items.some(i => i.type === 'WRONG_CODE_LOCKOUT'), 'the wrong-code test earlier cancelled a pickup');
+  const onlyOverrides = await (await apiCall('GET', '/superadmin/operations/incidents?type=ADMIN_OVERRIDE&schoolId=school-default', superAdmin.token)).json();
+  assert.ok(onlyOverrides.items.length >= 1 && onlyOverrides.items.every(i => i.type === 'ADMIN_OVERRIDE' && i.schoolId === 'school-default'));
+  assert.equal((await apiCall('GET', '/superadmin/operations/incidents?from=2026-05-02&to=2026-05-01', superAdmin.token)).status, 400);
+
+  const review = body => apiCall('POST', '/superadmin/operations/incidents/review', superAdmin.token, body);
+  assert.equal((await review({ key: 'override:incident-override' })).status, 400, 'a note is required');
+  assert.equal((await review({ key: 'override:no-such-item', note: 'Checked with school' })).status, 404);
+  assert.equal((await review({ key: 'override:incident-override', note: 'Called the school; ID was checked' })).status, 204);
+  assert.equal((await review({ key: 'override:incident-override', note: 'Again' })).status, 409);
+  const stillOpen = await (await apiCall('GET', '/superadmin/operations/incidents', superAdmin.token)).json();
+  assert.ok(stillOpen.items.every(i => i.key !== 'override:incident-override'));
+  const reviewed = await (await apiCall('GET', '/superadmin/operations/incidents?state=reviewed', superAdmin.token)).json();
+  const done = reviewed.items.find(i => i.key === 'override:incident-override');
+  assert.equal(done.reviewNote, 'Called the school; ID was checked');
+  assert.equal(done.reviewedBy, 'Platform SUPER_ADMIN');
+  const entry = await waitForAudit(`action='INCIDENT_REVIEWED' AND target_id='incident-override'`, []);
+  assert.equal(entry.school_id, 'school-default');
+  assert.equal(entry.reason, 'Called the school; ID was checked');
+});
+
+// ---- Phase 4: Security Center and Compliance Center ------------------------------------------
+
+test('the Security Center shows sign-in trouble and two-step coverage, and can end an admin session without exposing tokens', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const overview = await (await apiCall('GET', '/superadmin/security/overview', superAdmin.token)).json();
+  assert.ok(overview.lockoutsWeek >= 1, 'earlier tests locked an account name');
+  assert.ok(overview.mfa.platformAdmins.total >= 1 && overview.mfa.parents.total >= 1);
+  assert.ok(Array.isArray(overview.suspicious.targetedAccounts));
+
+  const adminB = await login('admin-b@test.local', 'password');
+  const sessionsResponse = await apiCall('GET', '/superadmin/security/sessions', superAdmin.token);
+  const sessionsText = await sessionsResponse.text();
+  assert.ok(!sessionsText.includes(adminB.token) && !sessionsText.includes(superAdmin.token), 'session tokens are never returned');
+  const sessions = JSON.parse(sessionsText);
+  const mine = sessions.find(s => s.current);
+  const theirs = sessions.find(s => s.userId === 'admin-b');
+  assert.match(theirs.id, /^[0-9a-f]{64}$/);
+  assert.equal((await apiCall('POST', `/superadmin/security/sessions/${mine.id}/end`, superAdmin.token, { reason: 'Testing my own session' })).status, 400);
+  assert.equal((await apiCall('POST', `/superadmin/security/sessions/${theirs.id}/end`, superAdmin.token, {})).status, 400, 'reason required');
+  assert.equal((await apiCall('POST', `/superadmin/security/sessions/${theirs.id}/end`, superAdmin.token, { reason: 'Laptop reported stolen' })).status, 204);
+  assert.equal((await apiCall('GET', '/admin/students', adminB.token)).status, 401, 'that session is signed out');
+  assert.equal((await apiCall('POST', `/superadmin/security/sessions/${theirs.id}/end`, superAdmin.token, { reason: 'Laptop reported stolen' })).status, 404);
+  const ended = await waitForAudit(`action='SESSION_ENDED_BY_PLATFORM' AND target_id='admin-b'`, []);
+  assert.equal(ended.reason, 'Laptop reported stolen');
+
+  const logins = await (await apiCall('GET', '/superadmin/security/events?category=logins&outcome=failed', superAdmin.token)).json();
+  assert.ok(logins.entries.length > 0 && logins.entries.every(e => e.action === 'SIGN_IN_FAILED'));
+  const changes = await (await apiCall('GET', '/superadmin/security/events?category=changes', superAdmin.token)).json();
+  assert.ok(changes.entries.some(e => e.action === 'SESSION_ENDED_BY_PLATFORM'));
+
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/security/overview', billing.token)).status, 403);
+  const schoolAdmin = await login('admin@school.test', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/security/sessions', schoolAdmin.token)).status, 403);
+});
+
+test('an export request is reviewed, approved, downloaded and completed, with every step in the audit log', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const create = body => apiCall('POST', '/superadmin/compliance/data-requests', superAdmin.token, body);
+  assert.equal((await create({ schoolId: 'school-b', kind: 'EXPORT', subjectType: 'STUDENT', subjectId: 'child-1', requesterName: 'Someone' })).status, 400, "another school's student");
+  const created = await create({ schoolId: 'school-default', kind: 'EXPORT', subjectType: 'STUDENT', subjectId: 'child-1', requesterName: 'Parker Parent', requesterRelationship: 'Parent', receivedVia: 'Email to the school' });
+  assert.equal(created.status, 201);
+  const request = await created.json();
+  assert.equal(request.status, 'REQUESTED');
+  assert.ok(request.dueAt > request.createdAt);
+  const status = (to, note) => apiCall('POST', `/superadmin/compliance/data-requests/${request.id}/status`, superAdmin.token, { status: to, note });
+
+  assert.equal((await apiCall('GET', `/superadmin/compliance/data-requests/${request.id}/export`, superAdmin.token)).status, 409, 'not approved yet');
+  assert.equal((await status('APPROVED', 'Skipping review')).status, 409, 'must be reviewed first');
+  assert.equal((await status('UNDER_REVIEW')).status, 200);
+  assert.equal((await status('APPROVED')).status, 400, 'approval needs a note');
+  assert.equal((await status('APPROVED', 'Identity of parent confirmed by the school')).status, 200);
+  const download = await apiCall('GET', `/superadmin/compliance/data-requests/${request.id}/export`, superAdmin.token);
+  assert.equal(download.status, 200);
+  assert.match(download.headers.get('content-disposition'), /attachment/);
+  const exported = await download.text();
+  assert.doesNotMatch(exported, /password_hash|scrypt\$|pickup_code/);
+  assert.equal((await (await apiCall('GET', `/superadmin/compliance/data-requests/${request.id}`, superAdmin.token)).json()).status, 'PROCESSING');
+  assert.equal((await status('COMPLETED', 'Sent to the parent through the school')).status, 200);
+  assert.equal((await status('UNDER_REVIEW')).status, 409, 'completed requests are final');
+
+  const detail = await (await apiCall('GET', `/superadmin/compliance/data-requests/${request.id}`, superAdmin.token)).json();
+  assert.deepEqual(detail.history.map(h => h.action), ['DATA_EXPORT_REQUESTED', 'DATA_REQUEST_UNDER_REVIEW', 'DATA_REQUEST_APPROVED', 'DATA_EXPORTED', 'DATA_REQUEST_COMPLETED']);
+  const list = await (await apiCall('GET', '/superadmin/compliance/data-requests?status=COMPLETED&kind=EXPORT', superAdmin.token)).json();
+  assert.ok(list.items.some(r => r.id === request.id));
+});
+
+test('a deletion needs a second person to approve, is blocked by a legal hold, and leaves only initials behind', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const second = await addPlatformAdmin('platform-2', 'PLATFORM_ADMIN');
+  await db.prepare(`INSERT INTO students (id,first_name,last_name,student_number,school_id,campus_id) VALUES ('student-forget','Fiona','Forget','B-99','school-b','campus-b')`).run();
+  await db.prepare(`INSERT INTO attendance_records (id,school_id,student_id,date,status) VALUES ('att-forget','school-b','student-forget','2026-03-03','PRESENT')`).run();
+
+  const created = await (await apiCall('POST', '/superadmin/compliance/data-requests', superAdmin.token, { schoolId: 'school-b', kind: 'DELETION', subjectType: 'STUDENT', subjectId: 'student-forget', requesterName: 'Fiona\'s parent' })).json();
+  const status = (token, to, note) => apiCall('POST', `/superadmin/compliance/data-requests/${created.id}/status`, token, { status: to, note });
+  assert.equal((await status(superAdmin.token, 'UNDER_REVIEW')).status, 200);
+  assert.equal((await status(superAdmin.token, 'APPROVED', 'I logged it and approve it')).status, 403, 'four eyes');
+
+  // A legal hold blocks approval and deletion, everywhere.
+  assert.equal((await apiCall('POST', '/superadmin/compliance/schools/school-b/legal-hold', second.token, { reason: 'Not my call' })).status, 403, 'super admins only');
+  assert.equal((await apiCall('POST', '/superadmin/compliance/schools/school-b/legal-hold', superAdmin.token, { reason: 'District records request pending' })).status, 204);
+  assert.equal((await status(second.token, 'APPROVED', 'Parent identity confirmed')).status, 409);
+  const adminB = await login('admin-b@test.local', 'password');
+  await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at='2020-01-01 00:00:00' WHERE id='student-b'`).run();
+  const held = await apiCall('DELETE', '/admin/students/student-b/permanent', adminB.token, { confirmName: 'Private Student' });
+  assert.equal(held.status, 409, "the school's own permanent delete is blocked too");
+  assert.match((await held.json()).error, /legal hold/);
+  await db.prepare(`UPDATE schools SET removed_student_retention_days=30 WHERE id='school-b'`).run();
+  const retention = await (await apiCall('POST', '/admin/retention/run', adminB.token)).json();
+  assert.equal(retention.onLegalHold, true);
+  assert.ok(await db.prepare(`SELECT 1 FROM students WHERE id='student-b'`).get(), 'retention skipped the held school');
+  await db.prepare(`UPDATE schools SET removed_student_retention_days=NULL WHERE id='school-b'`).run();
+  await db.prepare(`UPDATE students SET status='ACTIVE', archived_at=NULL WHERE id='student-b'`).run();
+  assert.equal((await apiCall('POST', '/superadmin/compliance/schools/school-b/legal-hold', superAdmin.token, { hold: false, reason: 'Records request answered' })).status, 204);
+  assert.ok(await waitForAudit(`action='LEGAL_HOLD_SET' AND school_id='school-b'`, []));
+
+  assert.equal((await status(second.token, 'APPROVED', 'Parent identity confirmed')).status, 200);
+  const run = body => apiCall('POST', `/superadmin/compliance/data-requests/${created.id}/run-deletion`, superAdmin.token, body);
+  assert.equal((await run({ confirmName: 'Fiona' })).status, 400);
+  const done = await run({ confirmName: 'fiona  forget' });
+  assert.equal(done.status, 200);
+  const result = await done.json();
+  assert.equal(result.status, 'COMPLETED');
+  assert.equal(result.subjectLabel, 'Student F.F. (deleted, #B-99)');
+  assert.equal(result.outcome.erased.attendanceRecords, 1);
+  assert.equal(await db.prepare(`SELECT 1 FROM students WHERE id='student-forget'`).get(), undefined);
+  assert.doesNotMatch(JSON.stringify(result), /Fiona Forget/);
+  assert.ok(await waitForAudit(`action='STUDENT_PERMANENTLY_DELETED' AND target_id='student-forget'`, []));
+});
+
+test('the Compliance Center reports controls it can check, without secrets', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const response = await apiCall('GET', '/superadmin/compliance/overview', superAdmin.token);
+  const text = await response.text();
+  const overview = JSON.parse(text);
+  assert.equal(overview.controls.auditLogAppendOnly, true);
+  assert.ok(overview.controls.auditEntriesLast30Days > 0);
+  assert.ok(overview.requests.some(r => r.kind === 'DELETION' && r.status === 'COMPLETED'));
+  assert.doesNotMatch(text, /postgres:\/\/|MFA_ENCRYPTION_KEY=|SMTP_PASSWORD/);
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/compliance/overview', billing.token)).status, 403);
+  assert.equal((await apiCall('POST', '/superadmin/compliance/data-requests', billing.token, { schoolId: 'school-b', kind: 'EXPORT', subjectType: 'SCHOOL', requesterName: 'X' })).status, 403);
+});
+
+// ---- Phase 5: notifications, announcements, reports, billing ----------------------------------
+
+test('every email is logged without its sign-in link, and a retried invite gets a fresh link', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const admin = await login('admin@school.test', 'password');
+  assert.equal((await apiCall('POST', '/admin/guardians', admin.token, { fullName: 'Logged Parent', email: 'logged-parent@test.local' })).status, 201);
+  const logged = await (await apiCall('GET', '/superadmin/notifications/deliveries?template=invite&search=logged-parent', superAdmin.token)).json();
+  const delivery = logged.items[0];
+  assert.equal(delivery.status, 'SKIPPED', 'no email server in tests');
+  const row = await db.prepare('SELECT args FROM notification_deliveries WHERE id=?').get(delivery.id);
+  assert.doesNotMatch(row.args, /set-password|token|link/i, 'links are never stored');
+  assert.equal((await apiCall('GET', '/superadmin/notifications/deliveries', admin.token)).status, 403);
+  assert.equal((await apiCall('POST', `/superadmin/notifications/deliveries/${delivery.id}/retry`, superAdmin.token)).status, 409, 'retrying while email is off would be skipped again');
+
+  // With an (unreachable) email server configured, the retry runs: a new
+  // link is made, the attempt is logged against the original, and it fails.
+  const smtp = { SMTP_HOST: '127.0.0.1', SMTP_PORT: '1', SMTP_USER: 'u', SMTP_PASSWORD: 'p', SMTP_FROM: 'test@test.local' };
+  Object.assign(process.env, smtp);
+  try {
+    const user = await db.prepare(`SELECT id FROM users WHERE email='logged-parent@test.local'`).get();
+    const linksBefore = (await db.prepare('SELECT COUNT(*)::int AS n FROM account_links WHERE user_id=?').get(user.id)).n;
+    const retried = await apiCall('POST', `/superadmin/notifications/deliveries/${delivery.id}/retry`, superAdmin.token);
+    assert.equal(retried.status, 200);
+    assert.equal((await retried.json()).sent, false);
+    assert.equal((await db.prepare('SELECT COUNT(*)::int AS n FROM account_links WHERE user_id=?').get(user.id)).n, linksBefore + 1);
+    assert.equal((await db.prepare('SELECT status FROM notification_deliveries WHERE id=?').get(delivery.id)).status, 'RETRIED');
+    const attempt = await db.prepare('SELECT status, error FROM notification_deliveries WHERE retry_of=?').get(delivery.id);
+    assert.equal(attempt.status, 'FAILED');
+    const needs = await (await apiCall('GET', '/superadmin/needs-attention', superAdmin.token)).json();
+    assert.ok(needs.items.some(i => i.id === 'failed-emails'));
+    assert.equal((await apiCall('POST', `/superadmin/notifications/deliveries/${delivery.id}/retry`, superAdmin.token)).status, 409, 'already retried');
+  } finally {
+    for (const key of Object.keys(smtp)) delete process.env[key];
+  }
+});
+
+test('a platform announcement reaches the chosen schools as a message from SDPMPlus', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  const platformAdmin = await login('platform-2@test.local', 'password');
+  assert.equal((await apiCall('POST', '/superadmin/announcements', platformAdmin.token, { title: 'Hi', body: 'There' })).status, 403, 'super admins only');
+  assert.equal((await apiCall('POST', '/superadmin/announcements', superAdmin.token, { title: '', body: 'Missing title' })).status, 400);
+  const sent = await apiCall('POST', '/superadmin/announcements', superAdmin.token, { title: 'Maintenance Saturday', body: 'SDPMPlus will be down 1-2 AM.', audience: 'SCHOOL_ADMINS', schoolIds: ['school-b'] });
+  assert.equal(sent.status, 201);
+  assert.equal((await sent.json()).schoolCount, 1);
+  const adminB = await login('admin-b@test.local', 'password');
+  const inbox = await (await apiCall('GET', '/admin/notices', adminB.token)).json();
+  const notice = inbox.find(n => n.title === 'Maintenance Saturday');
+  assert.equal(notice.senderName, 'SDPMPlus');
+  const schoolA = await (await apiCall('GET', '/admin/notices', (await login('admin@school.test', 'password')).token)).json();
+  assert.ok(schoolA.every(n => n.title !== 'Maintenance Saturday'), 'only the chosen school');
+  const list = await (await apiCall('GET', '/superadmin/announcements', superAdmin.token)).json();
+  assert.equal(list[0].title, 'Maintenance Saturday');
+  assert.ok(await waitForAudit(`action='ANNOUNCEMENT_SENT'`, []));
+});
+
+test('reports preview every type, export through a background job, and only the person who asked can download', async () => {
+  const { runPendingJobs } = await import('../jobs.js');
+  const superAdmin = await login('super-1@test.local', 'password');
+  const types = await (await apiCall('GET', '/superadmin/reports', superAdmin.token)).json();
+  assert.equal(types.length, 6);
+  for (const type of types) {
+    const response = await apiCall('GET', `/superadmin/reports/${type.key}?from=2026-01-01&to=2026-12-31`, superAdmin.token);
+    assert.equal(response.status, 200, type.key);
+    const body = await response.json();
+    assert.deepEqual(body.columns.map(c => c.key), type.columns.map(c => c.key));
+  }
+  assert.equal((await apiCall('GET', '/superadmin/reports/attendance?from=2026-03-01&to=2026-03-31&schoolId=school-b', superAdmin.token)).status, 200);
+  assert.equal((await apiCall('GET', '/superadmin/reports/attendance?from=2024-01-01&to=2026-01-01', superAdmin.token)).status, 400, 'at most a year');
+  assert.equal((await apiCall('GET', '/superadmin/reports/attendance?from=2026-05-02&to=2026-05-01', superAdmin.token)).status, 400);
+
+  // A school name that a spreadsheet would run as a formula stays text in the CSV.
+  await db.prepare(`INSERT INTO organizations (id,name) VALUES ('org-formula','Formula Org')`).run();
+  await db.prepare(`INSERT INTO schools (id,organization_id,name,code) VALUES ('school-formula','org-formula','=HYPERLINK("http://evil.test")','FORMULA')`).run();
+  const queued = await apiCall('POST', '/superadmin/reports/school-usage/export', superAdmin.token, { from: '2026-01-01', to: '2026-12-31' });
+  assert.equal(queued.status, 202);
+  const { jobId } = await queued.json();
+  assert.equal((await apiCall('GET', `/superadmin/jobs/${jobId}/download`, superAdmin.token)).status, 409, 'not ready yet');
+  await runPendingJobs();
+  const jobs = await (await apiCall('GET', '/superadmin/jobs', superAdmin.token)).json();
+  assert.equal(jobs.find(j => j.id === jobId).status, 'SUCCEEDED');
+  const download = await apiCall('GET', `/superadmin/jobs/${jobId}/download`, superAdmin.token);
+  assert.equal(download.status, 200);
+  assert.match(download.headers.get('content-type'), /text\/csv/);
+  const csv = await download.text();
+  assert.match(csv, /^﻿?School,Students,Staff/);
+  assert.match(csv, /"'=HYPERLINK\(""http:\/\/evil\.test""\)"/);
+  assert.ok(csv.includes('Demo School'));
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', `/superadmin/jobs/${jobId}/download`, billing.token)).status, 404, "someone else's export");
+  assert.ok(await waitForAudit(`action='REPORT_EXPORTED' AND target_id=?`, [jobId]));
+  await db.prepare(`UPDATE schools SET status='ARCHIVED' WHERE id='school-formula'`).run();
+});
+
+test('billing: a plan prices an invoice, payments mark it paid, and an overdue invoice needs attention', async () => {
+  const billing = await login('billing-1@test.local', 'password');
+  const superAdmin = await login('super-1@test.local', 'password');
+  const platformAdmin = await login('platform-2@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/billing/plans', platformAdmin.token)).status, 403, 'platform admins have no billing access');
+
+  const plan = await apiCall('POST', '/superadmin/billing/plans', billing.token, { name: 'Per student yearly', pricingModel: 'PER_STUDENT', priceCents: 500, interval: 'YEAR' });
+  assert.equal(plan.status, 201);
+  const { id: planId } = await plan.json();
+  assert.equal((await apiCall('PUT', '/superadmin/billing/schools/school-default/subscription', billing.token, { planId, status: 'ACTIVE', startedOn: '2026-08-01', currentPeriodEnd: '2027-07-31' })).status, 204);
+  const { n: students } = await db.prepare(`SELECT COUNT(*)::int AS n FROM students WHERE school_id='school-default' AND status='ACTIVE'`).get();
+
+  const created = await (await apiCall('POST', '/superadmin/billing/invoices', billing.token, { schoolId: 'school-default', periodStart: '2026-08-01', periodEnd: '2027-07-31', dueOn: '2099-01-01' })).json();
+  assert.equal(created.amountCents, 500 * students);
+  assert.match(created.number, /^INV-\d{4}-\d+$/);
+  const pay = body => apiCall('POST', `/superadmin/billing/invoices/${created.id}/payments`, billing.token, body);
+  assert.equal((await pay({ amountCents: 100, method: 'CHECK' })).status, 409, 'issue it first');
+  assert.equal((await apiCall('POST', `/superadmin/billing/invoices/${created.id}/issue`, billing.token)).status, 204);
+  assert.equal((await (await pay({ amountCents: 100, method: 'CHECK', reference: '#1001' })).json()).fullyPaid, false);
+  assert.equal((await pay({ amountCents: created.amountCents, method: 'ACH' })).status, 400, 'more than owed');
+  assert.equal((await (await pay({ amountCents: created.amountCents - 100, method: 'ACH' })).json()).fullyPaid, true);
+  const paid = await (await apiCall('GET', `/superadmin/billing/invoices/${created.id}`, billing.token)).json();
+  assert.equal(paid.status, 'PAID');
+  assert.equal(paid.payments.length, 2);
+  assert.equal((await apiCall('POST', `/superadmin/billing/invoices/${created.id}/void`, billing.token, { reason: 'Changed my mind' })).status, 409, 'a paid invoice cannot be voided');
+
+  const late = await (await apiCall('POST', '/superadmin/billing/invoices', superAdmin.token, { schoolId: 'school-default', description: 'Setup fee', amountCents: 25000, dueOn: '2020-01-01' })).json();
+  await apiCall('POST', `/superadmin/billing/invoices/${late.id}/issue`, superAdmin.token);
+  const summary = await (await apiCall('GET', '/superadmin/billing/summary', billing.token)).json();
+  assert.ok(summary.overdueCount >= 1 && summary.overdueCents >= 25000);
+  const needs = await (await apiCall('GET', '/superadmin/needs-attention', superAdmin.token)).json();
+  assert.ok(needs.items.some(i => i.id === 'billing-school-default'));
+  const overdue = await (await apiCall('GET', '/superadmin/billing/invoices?status=OVERDUE', billing.token)).json();
+  assert.ok(overdue.items.some(i => i.id === late.id && i.overdue));
+  assert.equal((await apiCall('POST', `/superadmin/billing/invoices/${late.id}/void`, billing.token, { reason: 'Waived for pilot' })).status, 204);
+  const schoolBilling = await (await apiCall('GET', '/superadmin/billing/schools/school-default', billing.token)).json();
+  assert.equal(schoolBilling.subscription.planName, 'Per student yearly');
+  assert.ok(await waitForAudit(`action='PAYMENT_RECORDED'`, []));
+  assert.ok(await waitForAudit(`action='SUBSCRIPTION_CHANGED' AND school_id='school-default'`, []));
+});
+
+// ---- Phase 6: system health and production hardening ------------------------------------------
+
+test('System Health reports each part of the platform without revealing settings', async () => {
+  const superAdmin = await login('super-1@test.local', 'password');
+  await fetch(`${apiBaseUrl}/api/health`, { headers: { 'X-Client': 'mobile-ios/1.4.0' } });
+  await fetch(`${apiBaseUrl}/api/health`, { headers: { 'X-Client': 'not a real client' } });
+  const response = await apiCall('GET', '/superadmin/system/health', superAdmin.token);
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const health = JSON.parse(text);
+  assert.equal(health.database.status, 'ok');
+  assert.equal(health.database.migrationsApplied, health.database.migrationsExpected);
+  assert.equal(health.email.status, 'not_configured');
+  assert.equal(health.sms.status, 'not_offered');
+  assert.ok(['ok', 'degraded'].includes(health.jobs.status));
+  assert.ok(health.database.largestTables.length > 0);
+  assert.ok(health.clients.some(c => c.client === 'mobile-ios' && c.version === '1.4.0'));
+  assert.ok(health.clients.every(c => c.client !== 'not a real client'));
+  assert.ok(!text.includes(process.env.DATABASE_URL), 'no connection string');
+  assert.doesNotMatch(text, /postgres:\/\/|password/i);
+
+  const check = await (await apiCall('POST', '/superadmin/system/email-check', superAdmin.token)).json();
+  assert.equal(check.ok, false);
+  assert.match(check.message, /not set up/);
+  const billing = await login('billing-1@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/system/health', billing.token)).status, 403);
+  const platformAdmin = await login('platform-2@test.local', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/system/health', platformAdmin.token)).status, 200);
+  assert.equal((await apiCall('POST', '/superadmin/system/email-check', platformAdmin.token)).status, 403);
+  const schoolAdmin = await login('admin@school.test', 'password');
+  assert.equal((await apiCall('GET', '/superadmin/system/health', schoolAdmin.token)).status, 403);
+});
+
+test('sign-in lockouts live in the database, so every server enforces them', async () => {
+  const identifier = `shared-${randomUUID()}@test.local`;
+  // Failures recorded by "another server" (straight into the shared table) lock this one too.
+  await db.prepare('INSERT INTO rate_limits (key,count,reset_at) VALUES (?,?,?)').run(`account:${identifier}`, 5, Date.now() + 60_000);
+  assert.equal((await apiCall('POST', '/auth/login', null, { identifier, password: 'whatever' })).status, 429);
+  // An expired window counts as nothing.
+  await db.prepare('UPDATE rate_limits SET reset_at=? WHERE key=?').run(Date.now() - 1, `account:${identifier}`);
+  assert.equal((await apiCall('POST', '/auth/login', null, { identifier, password: 'whatever' })).status, 401);
+  assert.equal((await db.prepare('SELECT count FROM rate_limits WHERE key=?').get(`account:${identifier}`)).count, 1, 'a new window started');
+});
+
+test('unknown API paths get a JSON 404, and the hot-path indexes exist', async () => {
+  const response = await apiCall('GET', '/no-such-thing');
+  assert.equal(response.status, 404);
+  assert.match(response.headers.get('content-type'), /application\/json/);
+  assert.deepEqual(await response.json(), { error: 'Not found' });
+  const { rows } = await (await import('../db.js')).pool.query(`SELECT indexname FROM pg_indexes WHERE schemaname='public'`);
+  const names = new Set(rows.map(r => r.indexname));
+  for (const name of ['student_guardians_guardian_idx', 'classes_teacher_idx', 'queue_items_student_status_idx', 'schools_organization_idx', 'audit_logs_created_idx']) {
+    assert.ok(names.has(name), name);
+  }
+});
+
+test('production settings that are unsafe are flagged without printing their values', async () => {
+  const { configWarnings } = await import('../config.js');
+  assert.deepEqual(configWarnings({ NODE_ENV: 'development', REQUIRE_ADMIN_MFA: 'false' }), [], 'development is not checked');
+  const warnings = configWarnings({ RAILWAY_ENVIRONMENT: 'production', REQUIRE_ADMIN_MFA: 'false', SEED_DEMO_DATA: 'true', PUBLIC_APP_URL: 'http://localhost:5173', SMTP_PASSWORD: 'hunter2' });
+  const settings = warnings.map(w => w.setting);
+  for (const setting of ['MFA_ENCRYPTION_KEY', 'REQUIRE_ADMIN_MFA', 'SEED_DEMO_DATA', 'PUBLIC_APP_URL', 'SMTP_*']) assert.ok(settings.includes(setting), setting);
+  assert.doesNotMatch(JSON.stringify(warnings), /hunter2|localhost:5173/);
+  const clean = configWarnings({
+    RAILWAY_ENVIRONMENT: 'production', MFA_ENCRYPTION_KEY: 'k', PUBLIC_APP_URL: 'https://www.sdpmplus.com',
+    SMTP_HOST: 'h', SMTP_PORT: '587', SMTP_USER: 'u', SMTP_PASSWORD: 'p', SMTP_FROM: 'f',
+  });
+  assert.deepEqual(clean, []);
+});

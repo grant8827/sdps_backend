@@ -1,4 +1,6 @@
 import nodemailer from 'nodemailer';
+import { randomUUID } from 'node:crypto';
+import { pool } from './db.js';
 
 const requiredSettings = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM'];
 
@@ -91,13 +93,40 @@ Sent by SDPMPlus${schoolName ? ` on behalf of ${escapeHtml(schoolName)}` : ''} �
 // Sending must never break the action that triggered it (creating an
 // account, approving a guardian...): a failure is logged — without the
 // link — and reported as { sent: false } so the caller can fall back.
-async function deliver(to, subject, message) {
+//
+// Every attempt is written to notification_deliveries (template + the
+// details needed to send it again, never a sign-in link) so the platform
+// can see failures and retry them (notifications.js).
+async function deliver(to, subject, message, log) {
+  const deliveryId = await recordDelivery(to, subject, log);
   try {
-    return await sendEmail({ to, subject, ...layout(message) });
+    const result = await sendEmail({ to, subject, ...layout(message) });
+    await finishDelivery(deliveryId, result.sent ? 'SENT' : 'SKIPPED', result.sent ? null : 'Email sending is not set up');
+    return { ...result, deliveryId };
   } catch (error) {
     console.error(`Could not send "${subject}" email:`, error?.message || error);
-    return { sent: false, reason: 'delivery-failed' };
+    await finishDelivery(deliveryId, 'FAILED', String(error?.message || error).slice(0, 300));
+    return { sent: false, reason: 'delivery-failed', deliveryId };
   }
+}
+
+async function recordDelivery(to, subject, log) {
+  if (!log) return null;
+  try {
+    const deliveryId = `delivery-${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO notification_deliveries (id,template,recipient,subject,school_name,args,status,retry_of) VALUES ($1,$2,$3,$4,$5,$6,'SENDING',$7)`,
+      [deliveryId, log.template, to, subject, log.args?.schoolName ?? null, JSON.stringify(log.args ?? {}), log.retryOf ?? null],
+    );
+    return deliveryId;
+  } catch (error) {
+    console.error('Could not record email delivery:', error?.message || error);
+    return null;
+  }
+}
+async function finishDelivery(deliveryId, status, error) {
+  if (!deliveryId) return;
+  try { await pool.query('UPDATE notification_deliveries SET status=$1, error=$2 WHERE id=$3', [status, error, deliveryId]); } catch { /* logged on insert */ }
 }
 
 /** Fire-and-forget for emails nobody waits on (message notifications). */
@@ -106,7 +135,8 @@ export function deliverLater(send) {
 }
 
 /** A new account: choose a password through the link (valid 7 days). */
-export function sendInviteEmail({ to, fullName, schoolName, roleLabel, link, invitedBy, pendingApproval }) {
+export function sendInviteEmail({ to, fullName, schoolName, roleLabel, link, invitedBy, pendingApproval, retryOf }) {
+  const log = { template: 'invite', retryOf, args: { fullName, schoolName, roleLabel, invitedBy, pendingApproval } };
   return deliver(to, `You're invited to ${schoolName} on SDPMPlus`, {
     schoolName,
     preheader: 'Set up your account to get started.',
@@ -121,21 +151,23 @@ export function sendInviteEmail({ to, fullName, schoolName, roleLabel, link, inv
     ],
     button: { label: 'Set up my account', url: link },
     footnote: "This link works once and expires in 7 days. If it has expired, ask the school to send a new one. If you weren't expecting this email, you can ignore it.",
-  });
+  }, log);
 }
 
 /** An existing account was added to another school (no new password needed). */
-export function sendAddedToSchoolEmail({ to, fullName, schoolName, roleLabel }) {
+export function sendAddedToSchoolEmail({ to, fullName, schoolName, roleLabel, retryOf }) {
+  const log = { template: 'addedToSchool', retryOf, args: { fullName, schoolName, roleLabel } };
   return deliver(to, `You've been added to ${schoolName} on SDPMPlus`, {
     schoolName,
     heading: `You've been added to ${schoolName}`,
     paragraphs: [`Hello ${fullName},`, `${schoolName} added you as ${roleLabel}. Sign in with your existing SDPMPlus email and password to see it.`],
     button: { label: 'Sign in', url: `${appBaseUrl()}/login` },
-  });
+  }, log);
 }
 
 /** "Forgot password?" or an admin-sent link (valid 1 hour). */
-export function sendPasswordResetEmail({ to, fullName, link, requestedByAdmin, expiresIn = '1 hour' }) {
+export function sendPasswordResetEmail({ to, fullName, link, requestedByAdmin, expiresIn = '1 hour', retryOf }) {
+  const log = { template: 'passwordReset', retryOf, args: { fullName, requestedByAdmin, expiresIn } };
   return deliver(to, 'Reset your SDPMPlus password', {
     preheader: `Choose a new password. This link expires in ${expiresIn}.`,
     heading: 'Reset your password',
@@ -148,11 +180,12 @@ export function sendPasswordResetEmail({ to, fullName, link, requestedByAdmin, e
     ],
     button: { label: 'Choose a new password', url: link },
     footnote: `This link works once and expires in ${expiresIn}. If you didn't ask for it, ignore this email; your password stays the same.`,
-  });
+  }, log);
 }
 
 /** Security notice after any password change. */
-export function sendPasswordChangedEmail({ to, fullName }) {
+export function sendPasswordChangedEmail({ to, fullName, retryOf }) {
+  const log = { template: 'passwordChanged', retryOf, args: { fullName } };
   return deliver(to, 'Your SDPMPlus password was changed', {
     heading: 'Your password was changed',
     paragraphs: [
@@ -162,11 +195,12 @@ export function sendPasswordChangedEmail({ to, fullName }) {
       "If it wasn't, reset your password right away and tell your school office.",
     ],
     button: { label: 'Reset my password', url: `${appBaseUrl()}/forgot-password` },
-  });
+  }, log);
 }
 
 /** Security notice when an administrator cleared someone's two-step verification. */
-export function sendMfaResetEmail({ to, fullName, schoolName, resetBy }) {
+export function sendMfaResetEmail({ to, fullName, schoolName, resetBy, retryOf }) {
+  const log = { template: 'mfaReset', retryOf, args: { fullName, schoolName, resetBy } };
   return deliver(to, 'Your two-step verification was reset', {
     schoolName,
     heading: 'Two-step verification was reset',
@@ -176,11 +210,12 @@ export function sendMfaResetEmail({ to, fullName, schoolName, resetBy }) {
       "If you didn't ask for this, contact your school office right away.",
     ],
     button: { label: 'Sign in', url: `${appBaseUrl()}/login` },
-  });
+  }, log);
 }
 
 /** Sent to the person who registered a new school. */
-export function sendSchoolWelcomeEmail({ to, fullName, schoolName, schoolCode }) {
+export function sendSchoolWelcomeEmail({ to, fullName, schoolName, schoolCode, retryOf }) {
+  const log = { template: 'schoolWelcome', retryOf, args: { fullName, schoolName, schoolCode } };
   return deliver(to, `${schoolName} is set up on SDPMPlus`, {
     schoolName,
     heading: `${schoolName} is ready`,
@@ -191,11 +226,12 @@ export function sendSchoolWelcomeEmail({ to, fullName, schoolName, schoolCode })
       'Administrator accounts use two-step verification. Keep your recovery codes somewhere safe.',
     ],
     button: { label: 'Open the dashboard', url: `${appBaseUrl()}/login` },
-  });
+  }, log);
 }
 
 /** To the parent who asked for another adult to be authorized. */
-export function sendGuardianDecisionEmail({ to, fullName, schoolName, adultName, approved, note }) {
+export function sendGuardianDecisionEmail({ to, fullName, schoolName, adultName, approved, note, retryOf }) {
+  const log = { template: 'guardianDecision', retryOf, args: { fullName, schoolName, adultName, approved, note } };
   return deliver(to, approved ? `${adultName} was approved for pickup` : `${adultName} was not approved`, {
     schoolName,
     heading: approved ? `${adultName} was approved` : `${adultName} was not approved`,
@@ -207,11 +243,12 @@ export function sendGuardianDecisionEmail({ to, fullName, schoolName, adultName,
       ...(note ? [`Note from the school: ${note}`] : []),
     ],
     button: { label: 'Open SDPMPlus', url: `${appBaseUrl()}/login` },
-  });
+  }, log);
 }
 
 /** To the adult who was just approved. */
-export function sendGuardianApprovedEmail({ to, fullName, schoolName, link }) {
+export function sendGuardianApprovedEmail({ to, fullName, schoolName, link, retryOf }) {
+  const log = { template: 'guardianApproved', retryOf, args: { fullName, schoolName, hadLink: Boolean(link) } };
   return deliver(to, `You're approved at ${schoolName}`, {
     schoolName,
     heading: "You're approved for drop-off and pick-up",
@@ -222,18 +259,19 @@ export function sendGuardianApprovedEmail({ to, fullName, schoolName, link }) {
     ],
     button: link ? { label: 'Set up my account', url: link } : { label: 'Sign in', url: `${appBaseUrl()}/login` },
     ...(link ? { footnote: 'This link works once and expires in 7 days.' } : {}),
-  });
+  }, log);
 }
 
 /** "You have a new message" — the message itself stays in the app. */
-export function sendNoticeEmail({ to, fullName, schoolName, senderName, title }) {
+export function sendNoticeEmail({ to, fullName, schoolName, senderName, title, retryOf }) {
+  const log = { template: 'notice', retryOf, args: { fullName, schoolName, senderName, title } };
   return deliver(to, `New message from ${schoolName}: ${title}`, {
     schoolName,
     preheader: `${senderName} sent you a message.`,
     heading: 'You have a new message',
     paragraphs: [`Hello ${fullName},`, `${senderName} sent a message: "${title}".`, 'Open SDPMPlus to read it.'],
     button: { label: 'Read the message', url: `${appBaseUrl()}/login` },
-  });
+  }, log);
 }
 
 export function appBaseUrl() {

@@ -111,7 +111,22 @@ export async function buildSchoolExport(schoolId) {
  * mention the student are kept — the audit log is append-only and is the
  * school's record that the deletion happened.
  */
+/** Thrown when a school's records are on legal hold and something tries to erase them. */
+export class LegalHoldError extends Error {
+  constructor(reason) {
+    super(`This school's records are on legal hold and can't be permanently deleted${reason ? ` (${reason})` : ''}.`);
+    this.status = 409;
+  }
+}
+
+/** The school's legal-hold reason, or null when it isn't on hold. */
+export async function legalHold(schoolId) {
+  return (await db.prepare('SELECT legal_hold_reason AS reason FROM schools WHERE id=?').get(schoolId))?.reason ?? null;
+}
+
 export async function permanentlyDeleteStudent(studentId, schoolId) {
+  const hold = await legalHold(schoolId);
+  if (hold) throw new LegalHoldError(hold);
   return withTransaction(async () => {
     const student = await db.prepare(`SELECT id FROM students WHERE id=? AND school_id=? AND status='ARCHIVED' FOR UPDATE`).get(studentId, schoolId);
     if (!student) return null;
@@ -159,6 +174,8 @@ export async function previewRetention(schoolId) {
 
 /** Applies one school's retention settings now; each erasure is audited. */
 export async function applyRetention(schoolId, { actor = null, ip = null } = {}) {
+  // A legal hold pauses retention entirely: nothing is erased, not even old pickup history.
+  if (await legalHold(schoolId)) return { studentsDeleted: 0, pickupHistoryDeleted: 0, onLegalHold: true };
   const school = await retentionSettings(schoolId);
   const { removedStudents } = await retentionCandidates(school);
   const runBy = actor ?? { id: null, full_name: 'Automatic retention' };
@@ -186,11 +203,16 @@ export async function applyRetention(schoolId, { actor = null, ip = null } = {})
   return { studentsDeleted, pickupHistoryDeleted };
 }
 
+// When this process last ran retention, for System Health.
+export const retentionStatus = { lastRunAt: null, failures: 0 };
+
 /** Every school with a retention setting — run daily by the server. */
 export async function applyRetentionEverywhere() {
-  const schools = await db.prepare(`SELECT id FROM schools WHERE removed_student_retention_days IS NOT NULL OR queue_history_retention_days IS NOT NULL`).all();
+  retentionStatus.lastRunAt = new Date().toISOString();
+  retentionStatus.failures = 0;
+  const schools = await db.prepare(`SELECT id FROM schools WHERE (removed_student_retention_days IS NOT NULL OR queue_history_retention_days IS NOT NULL) AND legal_hold_reason IS NULL`).all();
   for (const { id } of schools) {
-    try { await applyRetention(id); } catch (error) { console.error('Retention run failed for school', id, error); }
+    try { await applyRetention(id); } catch (error) { retentionStatus.failures++; console.error('Retention run failed for school', id, error); }
   }
 }
 

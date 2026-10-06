@@ -488,6 +488,320 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 24,
+    name: 'platform administration: platform admins, support sessions, school suspension, audit request ids',
+    async up(db) {
+      await db.exec(`
+        -- People who run SDPMPlus itself, above any one school. Their
+        -- permissions come from the role (permissions.js); none of them
+        -- gets school data except through a support session.
+        CREATE TABLE IF NOT EXISTS platform_admins (
+          user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          role TEXT NOT NULL CHECK(role IN ('SUPER_ADMIN','PLATFORM_ADMIN','SUPPORT_ADMIN','BILLING_ADMIN')),
+          status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DISABLED')),
+          created_by_user_id TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+
+        -- A platform admin's time-limited, audited look into one school,
+        -- tied to the sign-in session it was started from (SHA-256 of the
+        -- session token). Read-only unless allow_changes was granted.
+        CREATE TABLE IF NOT EXISTS support_sessions (
+          id TEXT PRIMARY KEY,
+          platform_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          session_token_hash TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          allow_changes INTEGER NOT NULL DEFAULT 0,
+          ip_address TEXT,
+          started_at BIGINT NOT NULL,
+          expires_at BIGINT NOT NULL,
+          ended_at BIGINT,
+          end_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS support_sessions_open_idx ON support_sessions(session_token_hash) WHERE ended_at IS NULL;
+        CREATE INDEX IF NOT EXISTS support_sessions_school_idx ON support_sessions(school_id, started_at DESC);
+
+        -- Schools are suspended or archived, never deleted.
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS suspended_at TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS suspended_reason TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS archived_at TEXT;
+        CREATE INDEX IF NOT EXISTS schools_status_idx ON schools(status, created_at DESC);
+
+        -- Which request an entry came from, the reason given for it, and
+        -- the support session it happened in (adding columns doesn't touch
+        -- the append-only rule on existing rows).
+        ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS request_id TEXT;
+        ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS reason TEXT;
+        ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS support_session_id TEXT;
+        -- Platform-wide audit search: newest first across all schools, and by action.
+        CREATE INDEX IF NOT EXISTS audit_logs_created_idx ON audit_logs(created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS audit_logs_action_created_idx ON audit_logs(action, created_at DESC);
+        CREATE INDEX IF NOT EXISTS audit_logs_actor_idx ON audit_logs(actor_user_id, created_at DESC);
+
+        -- The old super admin was a membership in one school, which gave
+        -- silent access to every school. Carry those people over as
+        -- SUPER_ADMIN platform admins, then archive (not delete) the old rows.
+        INSERT INTO platform_admins (user_id, role)
+          SELECT DISTINCT user_id, 'SUPER_ADMIN' FROM memberships WHERE role='platform_super_admin' AND status='ACTIVE'
+          ON CONFLICT (user_id) DO NOTHING;
+        UPDATE memberships SET status='ARCHIVED' WHERE role='platform_super_admin' AND status <> 'ARCHIVED';
+      `);
+    },
+  },  {
+    version: 25,
+    name: 'platform dashboard: indexes for date-range counts across all schools',
+    async up(db) {
+      // The platform dashboard counts the last 30 days across every
+      // school; without these each count would read the whole table.
+      await db.exec(`
+        -- Drop-offs/pickups completed per day, and overrides.
+        CREATE INDEX IF NOT EXISTS queue_items_approved_at_idx ON queue_items(approved_at) WHERE approved_at IS NOT NULL;
+        -- Requests made per day (active schools), and waiting requests by age.
+        CREATE INDEX IF NOT EXISTS queue_items_requested_at_idx ON queue_items(requested_at);
+        CREATE INDEX IF NOT EXISTS queue_items_pending_idx ON queue_items(requested_at) WHERE status='PENDING';
+        -- Attendance per day across schools (the existing index leads with school_id).
+        CREATE INDEX IF NOT EXISTS attendance_date_status_idx ON attendance_records(date, status);
+        -- Sessions alive right now (active users).
+        CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
+      `);
+    },
+  },  {
+    version: 26,
+    name: 'platform operations: incident reviews',
+    async up(db) {
+      // A platform admin marks a drop-off/pickup exception (an admin
+      // override, or a pickup cancelled for wrong codes) as reviewed, with
+      // a note. The incident itself stays where it is (queue_items or
+      // audit_logs); this only records that someone looked at it.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS incident_reviews (
+          incident_key TEXT PRIMARY KEY,
+          school_id TEXT REFERENCES schools(id),
+          note TEXT NOT NULL,
+          reviewed_by_user_id TEXT NOT NULL REFERENCES users(id),
+          reviewed_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        -- Incident list: overrides by date.
+        CREATE INDEX IF NOT EXISTS queue_items_override_idx ON queue_items(approved_at) WHERE verification_method='ADMIN_OVERRIDE';
+      `);
+    },
+  },  {
+    version: 27,
+    name: 'compliance: data requests and legal holds',
+    async up(db) {
+      await db.exec(`
+        -- Export and deletion requests (from a parent, a school or a
+        -- district) tracked from receipt to completion. Nothing is deleted
+        -- until a request is reviewed and approved; the audit log records
+        -- every step (target_type 'data_request').
+        CREATE TABLE IF NOT EXISTS data_requests (
+          id TEXT PRIMARY KEY,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          kind TEXT NOT NULL CHECK(kind IN ('EXPORT','DELETION')),
+          subject_type TEXT NOT NULL CHECK(subject_type IN ('STUDENT','PARENT','SCHOOL')),
+          subject_id TEXT,
+          subject_label TEXT NOT NULL,
+          requester_name TEXT NOT NULL,
+          requester_relationship TEXT,
+          received_via TEXT,
+          details TEXT,
+          status TEXT NOT NULL DEFAULT 'REQUESTED'
+            CHECK(status IN ('REQUESTED','UNDER_REVIEW','APPROVED','PROCESSING','COMPLETED','REJECTED')),
+          status_note TEXT,
+          due_at TEXT NOT NULL,
+          created_by_user_id TEXT NOT NULL REFERENCES users(id),
+          approved_by_user_id TEXT REFERENCES users(id),
+          outcome TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          completed_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS data_requests_status_idx ON data_requests(status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS data_requests_school_idx ON data_requests(school_id, created_at DESC);
+
+        -- A school's records must be kept (litigation, investigation,
+        -- contract dispute): no permanent deletion of any kind, including
+        -- the daily retention run, until the hold is released.
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS legal_hold_reason TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS legal_hold_at TEXT;
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS legal_hold_by_user_id TEXT REFERENCES users(id);
+      `);
+    },
+  },  {
+    version: 28,
+    name: 'audit log: insertion order',
+    async up(db) {
+      // created_at only has one-second precision, so entries written in
+      // the same second (one request's steps) had no reliable order.
+      // seq numbers every entry in the order it was written; existing
+      // rows are numbered in their current order. Adding a column does
+      // not touch the append-only rule (it guards UPDATE and DELETE).
+      await db.exec(`
+        ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS seq BIGSERIAL;
+        CREATE INDEX IF NOT EXISTS audit_logs_target_seq_idx ON audit_logs(target_type, target_id, seq);
+      `);
+    },
+  },  {
+    version: 29,
+    name: 'platform: background jobs, email delivery log, announcements, billing',
+    async up(db) {
+      await db.exec(`
+        -- Work too slow for a web request (report exports). One worker in
+        -- each server process claims jobs with SKIP LOCKED, so several
+        -- servers never run the same job. Results are kept 7 days.
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          params TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL DEFAULT 'QUEUED' CHECK(status IN ('QUEUED','RUNNING','SUCCEEDED','FAILED')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          result BYTEA,
+          result_name TEXT,
+          result_type TEXT,
+          result_size INTEGER,
+          created_by_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          started_at TEXT,
+          finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS jobs_queue_idx ON jobs(created_at) WHERE status='QUEUED';
+        CREATE INDEX IF NOT EXISTS jobs_creator_idx ON jobs(created_by_user_id, created_at DESC);
+
+        -- Every email the app tries to send. Sign-in links are never
+        -- stored: retrying an invite or reset makes a fresh link.
+        CREATE TABLE IF NOT EXISTS notification_deliveries (
+          id TEXT PRIMARY KEY,
+          channel TEXT NOT NULL DEFAULT 'EMAIL',
+          template TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          subject TEXT NOT NULL,
+          school_name TEXT,
+          args TEXT NOT NULL DEFAULT '{}',
+          status TEXT NOT NULL CHECK(status IN ('SENDING','SENT','FAILED','SKIPPED','RETRIED')),
+          error TEXT,
+          retry_of TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS notification_deliveries_created_idx ON notification_deliveries(created_at DESC, id);
+        CREATE INDEX IF NOT EXISTS notification_deliveries_status_idx ON notification_deliveries(status, created_at DESC);
+
+        -- Messages from SDPMPlus to schools' admins or staff, delivered as
+        -- ordinary notices (sender_role 'platform') in each school.
+        CREATE TABLE IF NOT EXISTS announcements (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+          audience TEXT NOT NULL CHECK(audience IN ('SCHOOL_ADMINS','ALL_STAFF')),
+          school_count INTEGER NOT NULL,
+          created_by_user_id TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        ALTER TABLE notices ADD COLUMN IF NOT EXISTS announcement_id TEXT REFERENCES announcements(id);
+        ALTER TABLE notices DROP CONSTRAINT IF EXISTS notices_sender_role_check;
+        ALTER TABLE notices ADD CONSTRAINT notices_sender_role_check CHECK(sender_role IN ('teacher','admin','parent','platform'));
+
+        -- Billing, independent of any payment company: what each school is
+        -- on, what it was invoiced, and what was paid. external_* fields
+        -- hold a provider's ids if one is connected later. Nothing here
+        -- switches a school's service on or off.
+        CREATE TABLE IF NOT EXISTS plans (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          description TEXT,
+          pricing_model TEXT NOT NULL CHECK(pricing_model IN ('FLAT','PER_STUDENT')),
+          price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
+          currency TEXT NOT NULL DEFAULT 'USD',
+          billing_interval TEXT NOT NULL CHECK(billing_interval IN ('MONTH','YEAR')),
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+          id TEXT PRIMARY KEY,
+          school_id TEXT NOT NULL UNIQUE REFERENCES schools(id),
+          plan_id TEXT NOT NULL REFERENCES plans(id),
+          status TEXT NOT NULL CHECK(status IN ('TRIALING','ACTIVE','PAST_DUE','CANCELED')),
+          started_on TEXT NOT NULL,
+          current_period_end TEXT,
+          notes TEXT,
+          external_provider TEXT,
+          external_id TEXT,
+          updated_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE TABLE IF NOT EXISTS invoices (
+          id TEXT PRIMARY KEY,
+          number TEXT NOT NULL UNIQUE,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          subscription_id TEXT REFERENCES subscriptions(id),
+          period_start TEXT,
+          period_end TEXT,
+          description TEXT NOT NULL,
+          amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+          currency TEXT NOT NULL DEFAULT 'USD',
+          status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN ('DRAFT','OPEN','PAID','VOID')),
+          due_on TEXT,
+          issued_at TEXT,
+          paid_at TEXT,
+          void_reason TEXT,
+          external_id TEXT,
+          created_by_user_id TEXT REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS invoices_school_idx ON invoices(school_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS invoices_status_idx ON invoices(status, due_on);
+        CREATE TABLE IF NOT EXISTS payments (
+          id TEXT PRIMARY KEY,
+          invoice_id TEXT NOT NULL REFERENCES invoices(id),
+          amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
+          method TEXT NOT NULL CHECK(method IN ('CHECK','ACH','CARD','WIRE','OTHER')),
+          reference TEXT,
+          received_on TEXT NOT NULL,
+          recorded_by_user_id TEXT REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS payments_invoice_idx ON payments(invoice_id);
+        CREATE SEQUENCE IF NOT EXISTS invoice_number_seq START 1001;
+      `);
+    },
+  },  {
+    version: 30,
+    name: 'production hardening: shared rate limits, app versions, indexes for hot lookups',
+    async up(db) {
+      await db.exec(`
+        -- Rate limits (sign-in lockouts, password-reset requests, platform
+        -- API) shared by every server process, instead of each keeping
+        -- its own count in memory. Expired rows are swept hourly.
+        CREATE TABLE IF NOT EXISTS rate_limits (
+          key TEXT PRIMARY KEY,
+          count INTEGER NOT NULL,
+          reset_at BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS rate_limits_reset_idx ON rate_limits(reset_at);
+
+        -- Which app versions are in use (the mobile app sends X-Client).
+        CREATE TABLE IF NOT EXISTS client_versions (
+          client TEXT NOT NULL,
+          version TEXT NOT NULL,
+          first_seen TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          last_seen TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          PRIMARY KEY (client, version)
+        );
+
+        -- Foreign keys on hot paths that had no index (see docs/database-indexes.md):
+        CREATE INDEX IF NOT EXISTS student_guardians_guardian_idx ON student_guardians(guardian_id);          -- every parent screen
+        CREATE INDEX IF NOT EXISTS student_enrollments_class_idx ON student_enrollments(class_id);            -- class rosters, attendance by class
+        CREATE INDEX IF NOT EXISTS student_enrollments_student_idx ON student_enrollments(student_id, school_year_id); -- a student's current class
+        CREATE INDEX IF NOT EXISTS classes_teacher_idx ON classes(teacher_user_id);                           -- teacher queue/class (polled)
+        CREATE INDEX IF NOT EXISTS queue_items_student_status_idx ON queue_items(student_id, status);         -- open request per child
+        CREATE INDEX IF NOT EXISTS queue_items_requested_by_idx ON queue_items(requested_by_user_id);         -- a parent's requests, adoption report
+        CREATE INDEX IF NOT EXISTS guardian_requests_guardian_idx ON guardian_requests(guardian_id, status);  -- pending requests for an adult
+        CREATE INDEX IF NOT EXISTS schools_organization_idx ON schools(organization_id);                      -- district admins' schools, every request
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {
@@ -502,3 +816,6 @@ export async function runMigrations(db, withTransaction) {
     });
   }
 }
+
+/** The newest migration this code knows about (System Health compares it with the database). */
+export const LATEST_MIGRATION = migrations[migrations.length - 1].version;

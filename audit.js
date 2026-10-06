@@ -29,14 +29,18 @@ export function sanitizeDetails(value, depth = 0) {
  * Writes one entry. Never throws — a failed audit write is logged to
  * the console instead of failing (or un-doing) the action it describes.
  */
-export async function writeAudit({ schoolId = null, actor = null, actorRole = null, action, targetType = null, targetId = null, targetLabel = null, details = null, ip = null }) {
+export async function writeAudit({
+  schoolId = null, actor = null, actorRole = null, action, targetType = null, targetId = null, targetLabel = null, details = null, ip = null,
+  reason = null, requestId = null, supportSessionId = null,
+}) {
   try {
     const cleanDetails = details && Object.keys(details).length ? JSON.stringify(sanitizeDetails(details)) : null;
     await pool.query(
-      `INSERT INTO audit_logs (id,school_id,actor_user_id,actor_name,actor_role,action,target_type,target_id,target_label,details,ip_address)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      `INSERT INTO audit_logs (id,school_id,actor_user_id,actor_name,actor_role,action,target_type,target_id,target_label,details,ip_address,reason,request_id,support_session_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [id('audit'), schoolId, actor?.id ?? null, actor?.full_name ?? actor?.fullName ?? null, actorRole ?? actor?.role ?? null,
-        action, targetType, targetId, targetLabel, cleanDetails, ip],
+        action, targetType, targetId, targetLabel, cleanDetails, ip, typeof reason === 'string' ? reason.slice(0, 500) : null,
+        requestId, supportSessionId],
     );
   } catch (error) {
     console.error('Audit log write failed', action, error);
@@ -91,13 +95,17 @@ export const audited = (action, describe = () => ({})) => (req, res, next) => {
       await writeAudit({
         schoolId: entry.schoolId ?? req.school?.id ?? await defaultSchoolFor(entry.actor ?? req.user),
         actor: entry.actor ?? req.user,
-        actorRole: entry.actorRole ?? req.membership?.role ?? req.user?.role,
+        // In a support session the actor is the platform admin, not a school admin.
+        actorRole: entry.actorRole ?? req.supportSession?.platformRole ?? req.membership?.role ?? req.user?.role,
         action: entry.action ?? action,
         targetType: entry.targetType ?? null,
         targetId: entry.targetId ?? null,
         targetLabel: entry.targetLabel ?? await labelFor(entry.targetType, entry.targetId),
         details: entry.details !== undefined ? entry.details : req.body,
         ip: req.ip,
+        reason: entry.reason ?? null,
+        requestId: req.requestId ?? null,
+        supportSessionId: req.supportSession?.id ?? null,
       });
     } catch (error) {
       console.error('Audit log write failed', action, error);

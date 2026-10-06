@@ -1,19 +1,24 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { db, id, passwordHash, verifyPassword, isUniqueViolation, withTransaction } from './db.js';
-import { createSession, endAllSessions, endChallenge, failChallenge, findChallenge, login, logout, mfaRequiredFor, requireAuth, requireRole } from './auth.js';
+import { db, id, passwordHash, pool, verifyPassword, isUniqueViolation, withTransaction } from './db.js';
+import { canSignIn, createSession, endAllSessions, endChallenge, failChallenge, findChallenge, login, logout, mfaRequiredFor, requireAuth, requireRole } from './auth.js';
+import { superadmin } from './superadmin.js';
+import { emailNoticeLater } from './notifications.js';
+import { startJobWorker } from './jobs.js';
+import { clear as clearLimit, hit as hitLimit, peek as peekLimit, startRateLimitSweeper } from './rateLimit.js';
+import { configWarnings } from './config.js';
 import { decryptSecret, encryptSecret, hashRecoveryCode, looksLikeRecoveryCode, newRecoveryCodes, newTotpSecret, otpauthUri, verifyTotp } from './mfa.js';
 import { SCHOOL_ADMIN_ROLES, getMemberships, requireSchoolAccess } from './tenant.js';
 import { asyncRoute } from './asyncRoute.js';
 import { audited, writeAudit } from './audit.js';
-import { MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
+import { LegalHoldError, MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
 import { ADMIN_RESET_TTL_MS, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
 import {
   deliverLater, sendAddedToSchoolEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail, sendMfaResetEmail,
-  sendNoticeEmail, sendPasswordChangedEmail, sendPasswordResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
+  sendPasswordChangedEmail, sendPasswordResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
 } from './mailer.js';
-import { randomInt, timingSafeEqual } from 'node:crypto';
+import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
@@ -216,6 +221,35 @@ async function geocodeAddress(address) {
 // app) actually fits.
 app.use(express.json({ limit: '6mb' }));
 
+// Every request gets an id, returned as X-Request-ID and stored on any
+// audit entry it writes, so an entry can be matched to server logs.
+app.use((req, res, next) => {
+  req.requestId = randomUUID();
+  res.setHeader('X-Request-ID', req.requestId);
+  next();
+});
+
+// Which app versions are in use: the mobile app sends "X-Client:
+// mobile-ios/1.2.0". Recorded at most every 10 minutes per version.
+const CLIENT_HEADER = /^(mobile-ios|mobile-android|web)\/([\w.-]{1,20})$/;
+const clientSeen = new Map();
+app.use((req, res, next) => {
+  const match = CLIENT_HEADER.exec(req.headers['x-client'] ?? '');
+  if (match) {
+    const key = `${match[1]}/${match[2]}`;
+    if ((clientSeen.get(key) ?? 0) < Date.now() - 10 * 60 * 1000) {
+      clientSeen.set(key, Date.now());
+      pool.query(`INSERT INTO client_versions (client, version) VALUES ($1,$2)
+        ON CONFLICT (client, version) DO UPDATE SET last_seen=to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')`, [match[1], match[2]])
+        .catch(() => {});
+    }
+  }
+  next();
+});
+
+// Platform administration (super admins etc.) — see superadmin.js.
+app.use('/api/superadmin', superadmin);
+
 const MAX_PHOTO_DATA_URL_LENGTH = 4_000_000; // ~3MB of image, base64-inflated
 function normalizePhotoDataUrl(value) {
   if (!value) return null;
@@ -240,23 +274,11 @@ app.get('/api/health', (req, res) => {
 // Brute-force guard on sign-in: too many failed attempts within the
 // window locks that account name (from any IP) and that IP (across any
 // account names) until the window passes. A successful sign-in clears
-// the account's counter. In-memory, so it resets on restart and isn't
-// shared between server instances — fine for one instance; move it to
-// the database (or Redis) before running several.
+// the account's counter. Counts live in the database (rateLimit.js), so
+// every server process enforces the same lockout.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const MAX_FAILURES_PER_ACCOUNT = 5;
 const MAX_FAILURES_PER_IP = 20;
-const loginFailures = new Map(); // key -> { count, resetAt }
-function failureCount(key) {
-  const entry = loginFailures.get(key);
-  if (!entry || entry.resetAt <= Date.now()) { loginFailures.delete(key); return 0; }
-  return entry.count;
-}
-function recordFailure(key) {
-  const count = failureCount(key) + 1;
-  loginFailures.set(key, { count, resetAt: loginFailures.get(key)?.resetAt ?? Date.now() + LOGIN_WINDOW_MS });
-}
-setInterval(() => { for (const key of loginFailures.keys()) failureCount(key); }, LOGIN_WINDOW_MS).unref();
 
 // A failed or locked-out sign-in for a real account is filed under each
 // school that account belongs to, so that school's admins can see
@@ -279,18 +301,18 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const identifier = String(req.body.identifier || '').trim();
   const accountKey = `account:${identifier.toLowerCase()}`;
   const ipKey = `ip:${req.ip}`;
-  if (failureCount(accountKey) >= MAX_FAILURES_PER_ACCOUNT || failureCount(ipKey) >= MAX_FAILURES_PER_IP) {
+  if ((await peekLimit(accountKey)) >= MAX_FAILURES_PER_ACCOUNT || (await peekLimit(ipKey)) >= MAX_FAILURES_PER_IP) {
     await auditSignIn('SIGN_IN_LOCKED_OUT', identifier, req.ip);
     return res.status(429).json({ error: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
   }
   const session = await login(identifier, String(req.body.password || ''));
   if (!session) {
-    recordFailure(accountKey);
-    recordFailure(ipKey);
+    await hitLimit(accountKey, LOGIN_WINDOW_MS);
+    await hitLimit(ipKey, LOGIN_WINDOW_MS);
     await auditSignIn('SIGN_IN_FAILED', identifier, req.ip);
     return res.status(401).json({ error: 'Invalid email/phone or password' });
   }
-  loginFailures.delete(accountKey);
+  await clearLimit(accountKey);
   // Right password but a second step is still owed: no session yet.
   if (!session.token) return res.json(session);
   await auditSignedIn(session, req.ip);
@@ -298,8 +320,11 @@ app.post('/api/auth/login', asyncRoute(async (req, res) => {
 }));
 
 async function auditSignedIn(session, ip, details = null) {
-  for (const schoolId of new Set(session.user.memberships.map(m => m.schoolId))) {
-    await writeAudit({ schoolId, actor: session.user, action: 'SIGNED_IN', targetType: 'user', targetId: session.user.id, details, ip });
+  // A platform admin with no school is still recorded, with no school.
+  const schoolIds = new Set(session.user.memberships.map(m => m.schoolId));
+  for (const schoolId of schoolIds.size ? schoolIds : [null]) {
+    const actorRole = schoolId ? null : session.user.platform?.role ?? null;
+    await writeAudit({ schoolId, actor: session.user, actorRole, action: 'SIGNED_IN', targetType: 'user', targetId: session.user.id, details, ip });
   }
 }
 async function auditForUser(user, action, ip, details = null, actor = user) {
@@ -478,28 +503,20 @@ function initialPassword(password) {
 // "Forgot password?" — always the same answer whether or not the email
 // has an account (so it can't be used to find out who's registered), and
 // the email is sent after responding so timing doesn't tell either.
-// Rate-limited per address and per IP.
+// Rate-limited per address and per IP (shared across servers, rateLimit.js).
 const RESET_WINDOW_MS = 60 * 60 * 1000;
-const resetRequests = new Map(); // key -> { count, resetAt }
-function overResetLimit(key, max) {
-  const now = Date.now();
-  const entry = resetRequests.get(key);
-  if (!entry || entry.resetAt <= now) { resetRequests.set(key, { count: 1, resetAt: now + RESET_WINDOW_MS }); return false; }
-  entry.count += 1;
-  return entry.count > max;
-}
-setInterval(() => { const now = Date.now(); for (const [key, entry] of resetRequests) if (entry.resetAt <= now) resetRequests.delete(key); }, RESET_WINDOW_MS).unref();
+const overResetLimit = async (key, max) => (await hitLimit(`reset:${key}`, RESET_WINDOW_MS)) > max;
 
 app.post('/api/auth/forgot-password', asyncRoute(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
   if (!email.includes('@') || email.length > 254) return res.status(400).json({ error: 'Enter the email address you sign in with.' });
   res.json({ message: "If that email has an SDPMPlus account, we've sent a link to reset the password. Check your inbox (and spam folder)." });
-  const emailLimited = overResetLimit(`email:${email}`, 3);
-  const ipLimited = overResetLimit(`ip:${req.ip}`, 10);
+  const emailLimited = await overResetLimit(`email:${email}`, 3);
+  const ipLimited = await overResetLimit(`ip:${req.ip}`, 10);
   if (emailLimited || ipLimited) return;
   deliverLater(async () => {
     const user = await db.prepare('SELECT id, full_name, email FROM users WHERE LOWER(email)=? AND active=1').get(email);
-    if (!user || !(await getMemberships(user.id)).length) return;
+    if (!user || !(await canSignIn(user.id))) return;
     const link = await createAccountLink(user.id, 'RESET');
     await sendPasswordResetEmail({ to: user.email, fullName: user.full_name, link });
     await auditForUser(user, 'PASSWORD_RESET_REQUESTED', req.ip, null);
@@ -819,7 +836,7 @@ app.get('/api/teacher/queue', requireAuth, requireRole('teacher'), asyncRoute(as
 // Front desk / office staff (membership role 'staff') get read access
 // to the admin console — queue, attendance, students, families,
 // messages — but every /api/admin route that changes data is
-// school_admin-only (platform_super_admin always passes too): staff
+// school_admin-only (a platform admin only via a support session): staff
 // can't create or suspend accounts, edit students or guardians, change
 // pickup authorization, run promotions or change school settings.
 app.get('/api/admin/queue', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
@@ -1813,58 +1830,6 @@ app.get('/api/teacher/parents', requireAuth, requireRole('teacher'), asyncRoute(
     ORDER BY u.full_name`).all(req.user.id));
 }));
 
-// "You have a new message" emails. Recipients mirror who sees the notice
-// in the app (/api/me/notices, /api/staff/notices, /api/admin/notices),
-// limited to active accounts with an active membership in that school,
-// never the sender. The email carries the title only; the message stays
-// in the app behind sign-in.
-async function noticeRecipients(notice) {
-  const parentInSchool = `JOIN memberships pm ON pm.user_id=u.id AND pm.school_id=? AND pm.role='parent' AND pm.status='ACTIVE'`;
-  switch (notice.target_type) {
-    case 'PARENT':
-      return db.prepare(`SELECT u.full_name, u.email FROM users u ${parentInSchool} WHERE u.id=? AND u.active=1`).all(notice.school_id, notice.target_parent_user_id);
-    case 'CLASS':
-      return db.prepare(`
-        SELECT DISTINCT u.full_name, u.email FROM classes c
-        JOIN student_enrollments e ON e.class_id=c.id
-        JOIN school_years y ON y.id=e.school_year_id AND y.status='ACTIVE'
-        JOIN students s ON s.id=e.student_id AND s.status='ACTIVE'
-        JOIN student_guardians sg ON sg.student_id=s.id
-        JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id
-        ${parentInSchool}
-        WHERE c.teacher_user_id=? AND c.school_id=? AND u.active=1`).all(notice.school_id, notice.target_teacher_id, notice.school_id);
-    case 'SCHOOL':
-      return db.prepare(`
-        SELECT DISTINCT u.full_name, u.email FROM students s
-        JOIN student_guardians sg ON sg.student_id=s.id
-        JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id
-        ${parentInSchool}
-        WHERE s.school_id=? AND s.status='ACTIVE' AND u.active=1`).all(notice.school_id, notice.school_id);
-    case 'STAFF':
-      return db.prepare(`
-        SELECT DISTINCT u.full_name, u.email FROM memberships m JOIN users u ON u.id=m.user_id
-        WHERE m.school_id=? AND m.role IN ('teacher','school_admin','staff') AND m.status='ACTIVE' AND u.active=1
-          AND (?::text IS NULL OR u.id=?)`).all(notice.school_id, notice.target_staff_user_id, notice.target_staff_user_id);
-    case 'ADMIN':
-      return db.prepare(`
-        SELECT DISTINCT u.full_name, u.email FROM memberships m JOIN users u ON u.id=m.user_id
-        WHERE m.school_id=? AND m.role IN ('school_admin','staff') AND m.status='ACTIVE' AND u.active=1`).all(notice.school_id);
-    default:
-      return [];
-  }
-}
-
-function emailNoticeLater(noticeId) {
-  deliverLater(async () => {
-    const notice = await db.prepare('SELECT n.*, s.name AS school_name, u.email AS sender_email FROM notices n JOIN schools s ON s.id=n.school_id LEFT JOIN users u ON u.id=n.sender_user_id WHERE n.id=?').get(noticeId);
-    if (!notice) return;
-    const recipients = (await noticeRecipients(notice)).filter(r => r.email.toLowerCase() !== notice.sender_email?.toLowerCase());
-    for (const person of recipients) {
-      await sendNoticeEmail({ to: person.email, fullName: person.full_name, schoolName: notice.school_name, senderName: notice.sender_name, title: notice.title });
-    }
-  });
-}
-
 app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
   const { title, body, targetType, targetParentUserId, targetStaffUserId } = req.body;
   // Exactly one notice is created per request; its recipients get an email once it's saved.
@@ -1972,7 +1937,7 @@ app.post('/api/notices', requireAuth, asyncRoute(async (req, res) => {
 // so a teacher's own inbox isn't cluttered with messages meant for the
 // office, but the office sees everything addressed to it in one place.
 app.get('/api/staff/notices', requireAuth, requireSchoolAccess('school_admin', 'staff', 'teacher'), asyncRoute(async (req, res) => {
-  const isAdminSide = ['school_admin', 'staff', 'platform_super_admin'].includes(req.membership.role);
+  const isAdminSide = ['school_admin', 'staff', 'district_admin'].includes(req.membership.role);
   res.json(await db.prepare(`
     SELECT n.id, n.title, n.body, n.sender_name AS "senderName", n.sender_role AS "senderRole", n.created_at AS "createdAt",
       CASE WHEN nr.user_id IS NULL THEN 0 ELSE 1 END AS read
@@ -2011,8 +1976,10 @@ app.get('/api/me/notices', requireAuth, requireRole('parent'), asyncRoute(async 
 // req.user.id regardless of role, so a parent marking their own feed
 // and an admin marking theirs both just work here.
 app.post('/api/notices/:id/read', requireAuth, asyncRoute(async (req, res) => {
-  const notice = await db.prepare('SELECT id FROM notices WHERE id=?').get(req.params.id);
-  if (!notice) return res.status(404).json({ error: 'Notice not found' });
+  // Only a notice from one of your own schools (no probing other schools' notice ids).
+  const notice = await db.prepare('SELECT id, school_id AS "schoolId" FROM notices WHERE id=?').get(req.params.id);
+  const mySchools = new Set((await getMemberships(req.user.id)).map(m => m.schoolId));
+  if (!notice || !mySchools.has(notice.schoolId)) return res.status(404).json({ error: 'Notice not found' });
   await db.prepare('INSERT INTO notice_reads (notice_id,user_id) VALUES (?,?) ON CONFLICT (notice_id, user_id) DO NOTHING').run(req.params.id, req.user.id);
   res.status(204).end();
 }));
@@ -2367,6 +2334,9 @@ app.get('/api/admin/audit-log', requireAuth, requireSchoolAccess('school_admin')
 
 // Serve the built React website (run `npm run build` in frontend/
 // first) so the same server hosts the site alongside the API.
+// Any /api path not handled above: a JSON 404, not the website or Express's HTML page.
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
+
 app.use(express.static(frontendDist));
 
 // SPA fallback: let the client-side router (react-router) handle any
@@ -2382,15 +2352,18 @@ app.get(/^(?!\/api\/).*/, (req, res, next) => {
 // a clean 500 instead of hanging the request (Express 4 doesn't catch
 // async rejections on its own).
 app.use((err, req, res, next) => {
-  console.error(err);
   if (res.headersSent) return next(err);
+  // A school on legal hold: a clear, expected refusal, not a server error.
+  if (err instanceof LegalHoldError) return res.status(409).json({ error: err.message });
+  console.error(err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
 export { app };
 
 if (process.env.NODE_ENV !== 'test') {
-  app.listen(port, () => {
+  for (const warning of configWarnings()) console.warn(`CONFIG WARNING (${warning.setting}): ${warning.message}`);
+  const server = app.listen(port, () => {
     console.log(`Server listening on ${port}`);
     verifyEmailConnection()
       .then(() => console.log(`SMTP connection verified (${process.env.SMTP_HOST}:${process.env.SMTP_PORT}).`))
@@ -2400,4 +2373,18 @@ if (process.env.NODE_ENV !== 'test') {
   const DAY_MS = 24 * 60 * 60 * 1000;
   setTimeout(() => applyRetentionEverywhere(), 60 * 1000).unref();
   setInterval(() => applyRetentionEverywhere(), DAY_MS).unref();
+  // Background jobs (report exports): see jobs.js.
+  startJobWorker();
+  startRateLimitSweeper();
+
+  // Deploys stop the old server with SIGTERM: stop taking new requests,
+  // let the ones in flight finish (up to 10 s), then close the database.
+  const shutdown = signal => {
+    console.log(`${signal} received, shutting down…`);
+    server.close(() => pool.end().finally(() => process.exit(0)));
+    setTimeout(() => process.exit(1), 10_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('unhandledRejection', error => console.error('Unhandled promise rejection:', error));
 }

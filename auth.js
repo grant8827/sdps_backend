@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { db, passwordHash, verifyPassword } from './db.js';
 import { getMemberships } from './tenant.js';
+import { getPlatformAdmin } from './permissions.js';
+import { endSupportSession } from './supportSessions.js';
 import { asyncRoute } from './asyncRoute.js';
 
 const ONE_DAY = 24 * 60 * 60 * 1000;
@@ -15,11 +17,15 @@ const deleteExpired = db.prepare('DELETE FROM sessions WHERE expires_at <= ?');
 const deleteSession = db.prepare('DELETE FROM sessions WHERE token=?');
 
 // An account is only usable while it holds at least one ACTIVE
-// membership in an ACTIVE school. Suspending or removing someone from
-// Faculty/Families only changes their membership row (users.active stays
-// 1), so without this a suspended teacher or parent could keep signing
-// in and calling the API — including requesting a pickup.
-const hasActiveMembership = { get: async userId => (await getMemberships(userId)).length > 0 };
+// membership in an ACTIVE school — or is an active platform admin.
+// Suspending or removing someone from Faculty/Families only changes their
+// membership row (users.active stays 1), so without this a suspended
+// teacher or parent could keep signing in and calling the API —
+// including requesting a pickup.
+export async function canSignIn(userId) {
+  return (await getMemberships(userId)).length > 0 || Boolean(await getPlatformAdmin(userId));
+}
+const hasActiveMembership = { get: canSignIn };
 
 // Two-step verification is mandatory for anyone on the admin dashboard
 // (school admins and front desk staff — users.role 'admin') and for
@@ -30,7 +36,7 @@ const hasActiveMembership = { get: async userId => (await getMemberships(userId)
 export async function mfaRequiredFor(user) {
   if (process.env.REQUIRE_ADMIN_MFA === 'false') return false;
   if (user.role === 'admin') return true;
-  return Boolean(await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND role='platform_super_admin' AND status='ACTIVE'`).get(user.id));
+  return Boolean(await getPlatformAdmin(user.id));
 }
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;
@@ -76,7 +82,9 @@ export async function createSession(user) {
   await deleteExpired.run(Date.now()); // opportunistic cleanup, no separate cron needed
   await insertSession.run(token, user.id, expiresAt);
   const memberships = await getMemberships(user.id);
-  return { token, expiresAt, user: { id: user.id, fullName: user.full_name, email: user.email, role: user.role, memberships } };
+  // Platform role and permissions, so the website can show the platform area; the API re-checks them on every call.
+  const platform = await getPlatformAdmin(user.id);
+  return { token, expiresAt, user: { id: user.id, fullName: user.full_name, email: user.email, role: user.role, memberships, platform } };
 }
 
 /**
@@ -98,6 +106,7 @@ export async function login(identifier, password) {
 }
 
 export async function logout(token) {
+  await endSupportSession(token, 'SIGNED_OUT');
   await deleteSession.run(token);
 }
 
@@ -112,6 +121,7 @@ export const requireAuth = asyncRoute(async (req, res, next) => {
   if (!session || session.expiresAt <= Date.now()) return res.status(401).json({ error: 'Authentication required' });
   req.user = await db.prepare('SELECT id,full_name,email,role FROM users WHERE id=? AND active=1').get(session.userId);
   if (!req.user || !(await hasActiveMembership.get(req.user.id))) return res.status(401).json({ error: 'Account is inactive' });
+  req.sessionToken = token; // support sessions belong to one sign-in session (supportSessions.js)
   next();
 });
 

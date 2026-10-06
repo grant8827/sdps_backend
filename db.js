@@ -16,7 +16,16 @@ types.setTypeParser(20, value => parseInt(value, 10));
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false },
+  // Limits so one slow query or a database hiccup can't hang the server:
+  // a query is cancelled after 60 s, and waiting for a connection gives up after 10 s.
+  max: Number(process.env.DB_POOL_MAX) || 10,
+  statement_timeout: 60_000,
+  connectionTimeoutMillis: 10_000,
+  idleTimeoutMillis: 30_000,
 });
+// An idle connection dropped by the database (restart, failover) is
+// replaced on next use; without a listener it would crash the process.
+pool.on('error', error => console.error('Database connection error (will reconnect):', error.message));
 
 // Lets `db.prepare(...).get/all/run` transparently use whichever
 // Postgres client is active for the *calling* async context — the pool

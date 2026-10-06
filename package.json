@@ -9,7 +9,8 @@
     "test": "node --env-file-if-exists=.env --test --test-isolation=none",
     "district": "node --env-file-if-exists=.env scripts/district.js",
     "reset-password": "node --env-file-if-exists=.env scripts/reset-password.js",
-    "email:test": "node --env-file-if-exists=.env scripts/smtp-check.js"
+    "email:test": "node --env-file-if-exists=.env scripts/smtp-check.js",
+    "platform-admin": "node --env-file-if-exists=.env scripts/platform-admin.js"
   },
   "dependencies": {
     "express": "^4.18.2",
