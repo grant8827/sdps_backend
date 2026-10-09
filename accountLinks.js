@@ -6,10 +6,12 @@ import { appBaseUrl } from './mailer.js';
 //   INVITE — a new account choosing its first password. Nobody else ever
 //            knows that password, so it never travels by email.
 //   RESET  — "Forgot password?", or an admin sending someone a fresh link.
+//   PIN_RESET — "Forgot PIN?": choose a new pickup PIN (pickupPin.js). It
+//            can't set a password, and a password link can't set a PIN.
 // The token is only in the link; the table keeps its SHA-256. Using a link
 // sets the password, burns every other open link for that person and
 // signs them out everywhere (the caller does the sign-out).
-const TTL_MS = { INVITE: 7 * 24 * 60 * 60 * 1000, RESET: 60 * 60 * 1000 };
+const TTL_MS = { INVITE: 7 * 24 * 60 * 60 * 1000, RESET: 60 * 60 * 1000, PIN_RESET: 60 * 60 * 1000 };
 const hashToken = token => createHash('sha256').update(String(token)).digest('hex');
 
 /** A password nobody knows, for an account that will choose its own via an INVITE link. */
@@ -29,7 +31,7 @@ export async function createAccountLink(userId, purpose, ttlMs = TTL_MS[purpose]
   await db.prepare('UPDATE account_links SET used_at=? WHERE user_id=? AND purpose=? AND used_at IS NULL').run(now, userId, purpose);
   await db.prepare('INSERT INTO account_links (token_hash,user_id,purpose,expires_at,created_at) VALUES (?,?,?,?,?)')
     .run(hashToken(token), userId, purpose, now + ttlMs, now);
-  return `${appBaseUrl()}/set-password?token=${token}`;
+  return `${appBaseUrl()}/${purpose === 'PIN_RESET' ? 'set-pin' : 'set-password'}?token=${token}`;
 }
 
 /** The open link's purpose and account, or null when it's unknown, used or expired. */
@@ -44,10 +46,18 @@ export async function findAccountLink(token) {
 /** Sets the password from an open link. Returns the link row, or null if it can't be used. */
 export async function useAccountLink(token, newPassword) {
   const link = await findAccountLink(token);
-  if (!link) return null;
+  if (!link || link.purpose === 'PIN_RESET') return null;
   const claimed = await db.prepare('UPDATE account_links SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), link.tokenHash);
   if (claimed.changes === 0) return null; // used twice at once — only the first wins
   await db.prepare('UPDATE users SET password_hash=?, needs_password_setup=0 WHERE id=?').run(passwordHash(newPassword), link.userId);
   await db.prepare('UPDATE account_links SET used_at=? WHERE user_id=? AND used_at IS NULL').run(Date.now(), link.userId);
   return link;
+}
+
+/** Claims an open "Forgot PIN?" link (single use). Returns the link row, or null. The caller then sets the PIN. */
+export async function claimPinLink(token) {
+  const link = await findAccountLink(token);
+  if (!link || link.purpose !== 'PIN_RESET') return null;
+  const claimed = await db.prepare('UPDATE account_links SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), link.tokenHash);
+  return claimed.changes === 0 ? null : link;
 }

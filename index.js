@@ -13,12 +13,14 @@ import { SCHOOL_ADMIN_ROLES, getMemberships, requireSchoolAccess } from './tenan
 import { asyncRoute } from './asyncRoute.js';
 import { audited, writeAudit } from './audit.js';
 import { LegalHoldError, MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
-import { ADMIN_RESET_TTL_MS, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
+import { MAX_LOGO_DATA_URL_LENGTH, imageHosts, parseImageDataUrl, removeStoredImage, signImageUrls, storageEnabled, storeImage } from './storage.js';
+import { ADMIN_RESET_TTL_MS, claimPinLink, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
+import { checkPin, hasPin, pinProblem, setPin } from './pickupPin.js';
 import {
   deliverLater, sendAddedToSchoolEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail, sendMfaResetEmail,
-  sendPasswordChangedEmail, sendPasswordResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
+  sendPasswordChangedEmail, sendPasswordResetEmail, sendPinChangedEmail, sendPinResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
 } from './mailer.js';
-import { randomInt, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const frontendDist = path.join(__dirname, '..', 'frontend', 'dist');
@@ -44,7 +46,7 @@ app.use((req, res, next) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Permissions-Policy', 'geolocation=(self), camera=(), microphone=()');
   res.setHeader('Content-Security-Policy', [
-    "default-src 'self'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", "img-src 'self' data: blob:",
+    "default-src 'self'", "script-src 'self'", "style-src 'self' 'unsafe-inline'", ["img-src 'self' data: blob:", ...imageHosts()].join(' '),
     "connect-src 'self'", "font-src 'self' data:", "object-src 'none'", "base-uri 'self'", "form-action 'self'", "frame-ancestors 'none'",
   ].join('; '));
   // /api/health stays reachable over plain HTTP — the platform's own
@@ -221,6 +223,19 @@ async function geocodeAddress(address) {
 // app) actually fits.
 app.use(express.json({ limit: '6mb' }));
 
+// Photos and logos kept in S3 are stored as private references
+// (storage.js). Every JSON response has them swapped for links that work
+// for an hour, so no route has to remember to do it.
+app.use((req, res, next) => {
+  const sendJson = res.json.bind(res);
+  res.json = body => {
+    if (!storageEnabled() || !body || typeof body !== 'object') return sendJson(body);
+    signImageUrls(body).then(sendJson, error => { console.error('Could not prepare image links', error); sendJson(body); });
+    return res;
+  };
+  next();
+});
+
 // Every request gets an id, returned as X-Request-ID and stored on any
 // audit entry it writes, so an entry can be matched to server logs.
 app.use((req, res, next) => {
@@ -250,15 +265,11 @@ app.use((req, res, next) => {
 // Platform administration (super admins etc.) — see superadmin.js.
 app.use('/api/superadmin', superadmin);
 
-const MAX_PHOTO_DATA_URL_LENGTH = 4_000_000; // ~3MB of image, base64-inflated
-function normalizePhotoDataUrl(value) {
-  if (!value) return null;
-  if (typeof value !== 'string' || !/^data:image\/(png|jpe?g|webp|gif);base64,/.test(value)) {
-    throw new Error('Photo must be a PNG, JPEG, WEBP, or GIF image');
-  }
-  if (value.length > MAX_PHOTO_DATA_URL_LENGTH) throw new Error('Photo is too large — please use a smaller image');
-  return value;
-}
+// Uploaded images arrive as base64 data URLs in the JSON body. They are
+// checked first (parseImageDataUrl, so a bad file is a 400 before any
+// other work), saved just before the database change (storeImage), and
+// removed again if that change fails (removeStoredImage).
+const LOGO_RULES = { folder: 'logo', label: 'Logo', maxLength: MAX_LOGO_DATA_URL_LENGTH, types: ['png', 'jpeg', 'webp'] };
 
 /**
  * One Node/Express server backs both clients: the React Native mobile
@@ -564,6 +575,67 @@ app.post('/api/admin/members/:userId/send-link', requireAuth, requireSchoolAcces
   res.json(sent ? { emailSent: true } : { emailSent: false, setupLink: link });
 }));
 
+// ---- Pickup PIN (pickupPin.js) -------------------------------------------------
+//
+// Parents only. The PIN itself never appears in a response, the audit log
+// (bodies with a `pin` are not copied: details are set explicitly) or an export.
+const parentSchoolId = async userId => (await getMemberships(userId)).find(m => m.role === 'parent')?.schoolId ?? null;
+
+app.get('/api/me/pin', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  res.json({ hasPin: await hasPin(req.user.id) });
+}));
+
+// First PIN. Once one exists it can only be changed with the current PIN or a "Forgot PIN?" link.
+app.post('/api/me/pin', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  if (await hasPin(req.user.id)) return res.status(409).json({ error: 'You already have a pickup PIN. Change it from your profile, or use "Forgot PIN?".', code: 'PIN_EXISTS' });
+  const problem = pinProblem(req.body?.pin);
+  if (problem) return res.status(400).json({ error: problem });
+  await setPin(req.user.id, req.body.pin);
+  await writeAudit({ schoolId: await parentSchoolId(req.user.id), actor: req.user, action: 'PICKUP_PIN_CREATED', targetType: 'user', targetId: req.user.id, ip: req.ip, requestId: req.requestId });
+  deliverLater(() => sendPinChangedEmail({ to: req.user.email, fullName: req.user.full_name }));
+  res.status(204).end();
+}));
+
+app.post('/api/me/pin/change', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  const problem = pinProblem(req.body?.newPin);
+  if (problem) return res.status(400).json({ error: problem });
+  const schoolId = await parentSchoolId(req.user.id);
+  const failure = await pinFailureResponse(req, schoolId, req.body?.currentPin);
+  if (failure) return res.status(failure.status).json(failure.body);
+  if (req.body.newPin === req.body.currentPin) return res.status(400).json({ error: 'Choose a PIN different from your current one.' });
+  await setPin(req.user.id, req.body.newPin);
+  await writeAudit({ schoolId, actor: req.user, action: 'PICKUP_PIN_CHANGED', targetType: 'user', targetId: req.user.id, ip: req.ip, requestId: req.requestId });
+  deliverLater(() => sendPinChangedEmail({ to: req.user.email, fullName: req.user.full_name }));
+  res.status(204).end();
+}));
+
+// "Forgot PIN?" — emails the signed-in parent a link to choose a new PIN.
+// When the email can't be sent, says so (unlike forgot-password, there's
+// nothing to hide: the person is already signed in).
+app.post('/api/me/pin/forgot', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
+  if ((await hitLimit(`pinreset:${req.user.id}`, RESET_WINDOW_MS)) > 3) {
+    return res.status(429).json({ error: 'You have asked for several PIN links already. Check your email, or try again in an hour.' });
+  }
+  const link = await createAccountLink(req.user.id, 'PIN_RESET');
+  const { sent } = await sendPinResetEmail({ to: req.user.email, fullName: req.user.full_name, link });
+  await writeAudit({ schoolId: await parentSchoolId(req.user.id), actor: req.user, action: 'PICKUP_PIN_RESET_REQUESTED', targetType: 'user', targetId: req.user.id, details: { emailSent: sent }, ip: req.ip, requestId: req.requestId });
+  if (!sent) return res.status(503).json({ error: "We couldn't send the email right now. Please ask your school office for help.", code: 'EMAIL_NOT_SENT' });
+  res.json({ message: `We emailed a link to ${req.user.email}. It works for 1 hour.` });
+}));
+
+// Where the emailed "Forgot PIN?" link lands (website /set-pin).
+app.post('/api/auth/set-pin', asyncRoute(async (req, res) => {
+  const problem = pinProblem(req.body?.pin);
+  if (problem) return res.status(400).json({ error: problem });
+  const link = await claimPinLink(req.body?.token);
+  if (!link) return res.status(404).json({ error: 'This link has expired or was already used. Ask for a new one.' });
+  await setPin(link.userId, req.body.pin);
+  const user = { id: link.userId, full_name: link.fullName };
+  await auditForUser(user, 'PICKUP_PIN_RESET', req.ip, null);
+  deliverLater(() => sendPinChangedEmail({ to: link.email, fullName: link.fullName }));
+  res.status(204).end();
+}));
+
 app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req => ({ targetType: 'user', targetId: req.user.id, details: null })), asyncRoute(async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Current and new password are required' });
@@ -588,12 +660,22 @@ const codeFromSchoolName = name => name.toUpperCase().replace(/[^A-Z0-9]/g, '').
 // doesn't exist yet (see CUSTOMER_OPERATIONS_GUIDE.md's production
 // readiness list).
 app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(async (req, res) => {
-  const { schoolName, campusName, campusAddress, adminFullName, email, password } = req.body;
+  const { schoolName, campusName, campusAddress, adminFullName, email, password, logoDataUrl } = req.body;
   if (!schoolName?.trim() || !campusName?.trim() || !adminFullName?.trim() || !email?.trim() || !password) {
     return res.status(400).json({ error: 'School name, campus name, your name, email, and password are all required.' });
   }
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  // The school's logo is optional, and can be added or changed later in School Setup.
+  try { parseImageDataUrl(logoDataUrl, LOGO_RULES); } catch (error) { return res.status(400).json({ error: error.message }); }
+  // Checked before the logo is uploaded so a sign-up that is going to
+  // be refused doesn't leave a file behind (checked again inside).
+  if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
+    return res.status(400).json({ error: 'An account with this email already exists.' });
+  }
+  const schoolId = id('school');
+  let logoUrl = null;
   try {
+    logoUrl = await storeImage(logoDataUrl, { schoolId, ...LOGO_RULES });
     const result = await withTransaction(async () => {
       if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
         throw new Error('An account with this email already exists.');
@@ -608,8 +690,7 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
       const organizationId = id('org');
       await db.prepare('INSERT INTO organizations (id,name) VALUES (?,?)').run(organizationId, schoolName.trim());
 
-      const schoolId = id('school');
-      await db.prepare('INSERT INTO schools (id,organization_id,name,code) VALUES (?,?,?,?)').run(schoolId, organizationId, schoolName.trim(), code);
+      await db.prepare('INSERT INTO schools (id,organization_id,name,code,logo_url) VALUES (?,?,?,?,?)').run(schoolId, organizationId, schoolName.trim(), code, logoUrl);
 
       const campusId = id('campus');
       const campusAddressFields = parseAddressFields(campusAddress);
@@ -639,6 +720,7 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
     };
     res.status(201).json(result.session);
   } catch (error) {
+    await removeStoredImage(logoUrl);
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
 }));
@@ -660,11 +742,7 @@ const studentSelect = `
 
 app.get('/api/me/students', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`${studentSelect} JOIN student_guardians sg ON sg.student_id=s.id JOIN guardians gu ON gu.id=sg.guardian_id JOIN memberships m ON m.user_id=gu.user_id AND m.school_id=s.school_id AND m.role='parent' AND m.status='ACTIVE' WHERE gu.user_id=? AND y.status='ACTIVE' AND s.status='ACTIVE' GROUP BY s.id,e.id,g.name,c.name,c.teacher_user_id,tu.full_name,sc.name,cp.name,cp.latitude,cp.longitude,cp.geofence_radius ORDER BY sc.name,s.last_name,s.first_name`).all(req.user.id);
-  // The pickup code for a child's pending pickup — only to the adult who
-  // requested it, never to other guardians of the same child.
-  const codes = new Map((await db.prepare(`SELECT student_id AS "studentId", pickup_code AS "pickupCode" FROM queue_items WHERE requested_by_user_id=? AND status='PENDING' AND request_type='PICK_UP' AND pickup_code IS NOT NULL`)
-    .all(req.user.id)).map(row => [row.studentId, row.pickupCode]));
-  res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare), pickupCode: codes.get(row.id) ?? null })));
+  res.json(rows.map(row => ({ ...row, status: row.pickupStatus, daycare: Boolean(row.daycare) })));
 }));
 
 // Read-only attendance history for a parent's own children — every
@@ -750,20 +828,27 @@ function distanceMeters(a, b) {
   return 6371000 * 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
 }
 
-// Pickup verification: every pickup request gets its own random 6-digit
-// code, shown only on the requesting adult's phone. The teacher (or an
-// admin) has to type it in to release the child — so a pickup can't be
-// accepted just because someone is signed in to a parent's account
-// somewhere; the person at the door has to hold the phone that asked.
-// The code is single-use (cleared once the request is decided) and
-// MAX_PICKUP_CODE_ATTEMPTS wrong entries cancel the request.
-const MAX_PICKUP_CODE_ATTEMPTS = 5;
-const newPickupCode = () => String(randomInt(0, 1_000_000)).padStart(6, '0');
-function pickupCodeMatches(expected, supplied) {
-  const a = Buffer.from(String(expected)); const b = Buffer.from(String(supplied ?? '').replace(/\s/g, ''));
-  return a.length === b.length && timingSafeEqual(a, b);
-}
+// A pickup is requested by an adult the school has authorized for that
+// child (student_guardians.can_pick_up), from within the school's pickup
+// area, with that adult's own 6-digit pickup PIN (pickupPin.js), and is
+// released when the child's teacher or an administrator confirms it.
 
+// Turns a PIN check into the response to send, or null when the PIN is
+// right. `code` lets the apps react (ask to create a PIN, show tries left)
+// without parsing the message. Failures are audited under `schoolId`.
+async function pinFailureResponse(req, schoolId, pin, studentId = null) {
+  const result = await checkPin(req.user.id, pin);
+  if (result.ok) return null;
+  if (result.reason === 'NOT_SET') return { status: 428, body: { error: 'Create your pickup PIN first.', code: 'PIN_NOT_SET' } };
+  const audit = { schoolId, actor: req.user, targetType: studentId ? 'student' : 'user', targetId: studentId ?? req.user.id, ip: req.ip, requestId: req.requestId };
+  if (result.reason === 'LOCKED' || result.lockedNow) {
+    if (result.lockedNow) await writeAudit({ ...audit, action: 'PICKUP_PIN_LOCKED_OUT' });
+    return { status: 429, body: { error: 'Too many wrong PINs. Wait 15 minutes, or use "Forgot PIN?" to choose a new one.', code: 'PIN_LOCKED' } };
+  }
+  await writeAudit({ ...audit, action: 'PICKUP_PIN_FAILED', details: { triesLeft: result.triesLeft } });
+  // 403, not 401: the apps treat 401 as "signed out".
+  return { status: 403, body: { error: `Wrong PIN. ${result.triesLeft} ${result.triesLeft === 1 ? 'try' : 'tries'} left.`, code: 'PIN_WRONG', triesLeft: result.triesLeft } };
+}
 async function createQueueRequest(req, res, requestType, requiredStatus, nextStatus) {
   const link = await guardianLinkQuery.get(req.params.studentId, req.user.id);
   if (!link) return res.status(403).json({ error: 'You are not linked to this student.' });
@@ -794,16 +879,21 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
       return res.status(403).json({ error: `You must be at the school location to ${requestType === 'DROP_OFF' ? 'drop off' : 'pick up'} this student.` });
     }
   }
+  // A pickup needs the parent's own PIN (pickupPin.js), checked last so a
+  // request refused for another reason never uses up a try.
+  if (requestType === 'PICK_UP') {
+    const pinFailure = await pinFailureResponse(req, context.schoolId, req.body?.pin, req.params.studentId);
+    if (pinFailure) return res.status(pinFailure.status).json(pinFailure.body);
+  }
   try {
     const itemId = id('queue');
-    const pickupCode = requestType === 'PICK_UP' ? newPickupCode() : null;
     await withTransaction(async () => {
-      await db.prepare(`INSERT INTO queue_items (id,school_id,campus_id,student_id,teacher_user_id,request_type,requested_by_user_id,pickup_code) VALUES (?,?,?,?,?,?,?,?)`)
-        .run(itemId, context.schoolId, context.campusId, req.params.studentId, context.teacherId, requestType, req.user.id, pickupCode);
+      await db.prepare(`INSERT INTO queue_items (id,school_id,campus_id,student_id,teacher_user_id,request_type,requested_by_user_id,verification_method) VALUES (?,?,?,?,?,?,?,?)`)
+        .run(itemId, context.schoolId, context.campusId, req.params.studentId, context.teacherId, requestType, req.user.id, requestType === 'PICK_UP' ? 'PIN' : null);
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(nextStatus, req.params.studentId);
     });
     res.locals.audit = { schoolId: context.schoolId, details: { queueItemId: itemId } };
-    res.status(201).json({ id: itemId, ...(pickupCode ? { pickupCode } : {}) });
+    res.status(201).json({ id: itemId });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
@@ -821,7 +911,7 @@ const queueSelect = `
   SELECT qi.id, qi.student_id AS "childId", s.first_name || ' ' || s.last_name AS "childName",
     s.photo_url AS "childPhotoUrl", c.name AS "className",
     qi.teacher_user_id AS "teacherId", qi.request_type AS "requestType", qi.requested_at AS "requestedAt",
-    u.full_name AS "parentName", (qi.pickup_code IS NOT NULL) AS "requiresCode"
+    u.full_name AS "parentName"
   FROM queue_items qi
   JOIN students s ON s.id=qi.student_id
   JOIN users u ON u.id=qi.requested_by_user_id
@@ -858,43 +948,10 @@ app.post('/api/queue/:id/approve', requireAuth, audited('QUEUE_REQUEST_ACCEPTED'
     targetType: 'student', targetId: item.student_id, details: { queueItemId: item.id, requestedByUserId: item.requested_by_user_id },
   };
 
-  // Pickup verification (see newPickupCode). A request from before codes
-  // existed has no pickup_code and goes through as before.
-  let verificationMethod = null; let overrideReason = null;
-  if (item.request_type === 'PICK_UP' && item.pickup_code) {
-    const reason = typeof req.body?.overrideReason === 'string' ? req.body.overrideReason.trim() : '';
-    if (reason) {
-      if (!isSchoolAdmin) return res.status(403).json({ error: 'Only an administrator can release a child without the pickup code.' });
-      verificationMethod = 'ADMIN_OVERRIDE'; overrideReason = reason.slice(0, 500);
-    } else if (pickupCodeMatches(item.pickup_code, req.body?.code)) {
-      verificationMethod = 'CODE';
-    } else {
-      const audit = { schoolId: item.school_id, actor: req.user, targetType: 'student', targetId: item.student_id, ip: req.ip };
-      const { attempts } = await db.prepare(`UPDATE queue_items SET pickup_code_attempts=pickup_code_attempts+1 WHERE id=? RETURNING pickup_code_attempts AS attempts`).get(item.id);
-      if (attempts >= MAX_PICKUP_CODE_ATTEMPTS) {
-        const lockoutNoticeId = id('notice');
-        await withTransaction(async () => {
-          await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL, declined_at=${NOW_UTC}, declined_by_user_id=? WHERE id=? AND status='PENDING'`).run(req.user.id, item.id);
-          await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id=?`).run(item.student_id);
-          await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type,target_parent_user_id) VALUES (?,?,?,?,?,?,?,?,?,?)`)
-            .run(lockoutNoticeId, item.school_id, item.campus_id, req.user.id, req.user.full_name, req.user.role === 'teacher' ? 'teacher' : 'admin',
-              'Pickup cancelled', 'Your pickup request was cancelled because the wrong pickup code was entered too many times. Please request the pickup again from your phone.', 'PARENT', item.requested_by_user_id);
-        });
-        await writeAudit({ ...audit, action: 'PICKUP_CODE_LOCKED_OUT', details: { queueItemId: item.id, attempts } });
-        emailNoticeLater(lockoutNoticeId);
-        return res.status(409).json({ error: 'Too many wrong codes. This pickup request has been cancelled; the parent needs to request it again.' });
-      }
-      await writeAudit({ ...audit, action: 'PICKUP_CODE_REJECTED', details: { queueItemId: item.id, attempts } });
-      const left = MAX_PICKUP_CODE_ATTEMPTS - attempts;
-      return res.status(422).json({ error: `Wrong pickup code. ${left} ${left === 1 ? 'try' : 'tries'} left.` });
-    }
-    res.locals.audit.details = { ...res.locals.audit.details, verificationMethod, overrideReason };
-  }
-
   try {
     await withTransaction(async () => {
-      const claimed = await db.prepare(`UPDATE queue_items SET status='APPROVED', approved_at=${NOW_UTC}, approved_by_user_id=?, pickup_code=NULL, verification_method=?, override_reason=? WHERE id=? AND status='PENDING'`)
-        .run(req.user.id, verificationMethod, overrideReason, item.id);
+      const claimed = await db.prepare(`UPDATE queue_items SET status='APPROVED', approved_at=${NOW_UTC}, approved_by_user_id=? WHERE id=? AND status='PENDING'`)
+        .run(req.user.id, item.id);
       if (claimed.changes === 0) throw new Error('This request was already handled.');
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'PRESENT' : 'PICKED_UP', item.student_id);
       // Accepting a drop-off also marks today's attendance PRESENT, so
@@ -940,7 +997,7 @@ app.post('/api/queue/:id/decline', requireAuth, audited('QUEUE_REQUEST_DECLINED'
   };
   try {
     await withTransaction(async () => {
-      await db.prepare(`UPDATE queue_items SET status='DECLINED', declined_at=${NOW_UTC}, declined_by_user_id=?, pickup_code=NULL WHERE id=?`).run(req.user.id, item.id);
+      await db.prepare(`UPDATE queue_items SET status='DECLINED', declined_at=${NOW_UTC}, declined_by_user_id=? WHERE id=?`).run(req.user.id, item.id);
       await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'AT_HOME' : 'PRESENT', item.student_id);
     });
     res.status(204).end();
@@ -1100,7 +1157,7 @@ app.get('/api/admin/overview', requireAuth, requireSchoolAccess('school_admin', 
 
 app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
   res.json({
-    school: await db.prepare('SELECT id,name,code,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
+    school: await db.prepare('SELECT id,name,code,logo_url AS "logoUrl",address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime" FROM schools WHERE id=?').get(req.school.id),
     campuses: await db.prepare('SELECT id,name,address,address_line1 AS "addressLine1",address_line2 AS "addressLine2",city,state,postal_code AS "postalCode",country,latitude,longitude,geofence_radius AS "geofenceRadius",timezone,status,start_time AS "startTime",dismissal_time AS "dismissalTime",extended_time AS "extendedTime",created_at AS "createdAt" FROM campuses WHERE school_id=? AND status<>\'ARCHIVED\' ORDER BY created_at, id').all(req.school.id)
       .then(rows => rows.map((row, index) => ({ ...row, isPrimary: index === 0 }))),
     schoolYears: await db.prepare('SELECT * FROM school_years WHERE school_id=? ORDER BY starts_on DESC').all(req.school.id),
@@ -1115,7 +1172,9 @@ app.get('/api/admin/setup', requireAuth, requireSchoolAccess('school_admin', 'st
 const isValidClockTime = value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 
 app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'), audited('SCHOOL_SETTINGS_UPDATED', req => ({ targetType: 'school', targetId: req.school.id })), asyncRoute(async (req, res) => {
-  const { name, address, startTime, dismissalTime, extendedTime } = req.body;
+  const { name, address, startTime, dismissalTime, extendedTime, logoDataUrl } = req.body;
+  // logoDataUrl: omitted keeps the logo, '' or null removes it, an image replaces it.
+  try { parseImageDataUrl(logoDataUrl, LOGO_RULES); } catch (error) { return res.status(400).json({ error: error.message }); }
   for (const [label, value] of [['startTime', startTime], ['dismissalTime', dismissalTime], ['extendedTime', extendedTime]]) {
     if (value !== undefined && value !== null && value !== '' && !isValidClockTime(value)) {
       return res.status(400).json({ error: `${label} must be a HH:MM time` });
@@ -1134,7 +1193,21 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'),
   };
   await db.prepare('UPDATE schools SET name=?, address=?, address_line1=?, address_line2=?, city=?, state=?, postal_code=?, country=?, start_time=?, dismissal_time=?, extended_time=? WHERE id=?')
     .run(next.name, next.address, addressFields.addressLine1 || null, addressFields.addressLine2 || null, addressFields.city || null, addressFields.state || null, addressFields.postalCode || null, addressFields.country || null, next.startTime, next.dismissalTime, next.extendedTime, req.school.id);
+  if (logoDataUrl !== undefined) {
+    let logoUrl;
+    try { logoUrl = await storeImage(logoDataUrl, { schoolId: req.school.id, ...LOGO_RULES }); } catch (error) { return res.status(400).json({ error: error.message }); }
+    const previous = (await db.prepare('SELECT logo_url FROM schools WHERE id=?').get(req.school.id))?.logo_url;
+    await db.prepare('UPDATE schools SET logo_url=? WHERE id=?').run(logoUrl, req.school.id);
+    await removeStoredImage(previous);
+    res.locals.audit = { details: { logo: logoUrl ? 'changed' : 'removed' } };
+  }
   res.status(204).end();
+}));
+
+// The school's name and logo, shown at the top of every signed-in
+// person's dashboard (parents, teachers, front desk, administrators).
+app.get('/api/me/school', requireAuth, requireSchoolAccess(), asyncRoute(async (req, res) => {
+  res.json(await db.prepare('SELECT id, name, logo_url AS "logoUrl" FROM schools WHERE id=?').get(req.school.id));
 }));
 
 // A "location" is a campus — some schools run more than one site with
@@ -1318,7 +1391,7 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin')
   let photoUrl, initial;
   try {
     initial = initialPassword(password);
-    photoUrl = normalizePhotoDataUrl(photoDataUrl); // optional — photo is never required
+    parseImageDataUrl(photoDataUrl); // optional — photo is never required
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
@@ -1328,6 +1401,7 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin')
     if (!assignedClass) return res.status(400).json({ error: 'That classroom does not belong to this school' });
   }
   try {
+    photoUrl = await storeImage(photoDataUrl, { schoolId: req.school.id, folder: 'staff' });
     const userId = await withTransaction(async () => {
       if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
         throw new Error('An account with this email already exists.');
@@ -1340,9 +1414,11 @@ app.post('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin')
       if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
       return userId;
     });
+    photoUrl = null; // saved with the account: nothing to clean up if the invite fails
     const invite = await inviteNewAccount({ userId, to: email.trim(), fullName: fullName.trim(), schoolName: req.school.name, roleLabel: 'a teacher' });
     res.status(201).json({ id: userId, ...invite });
   } catch (error) {
+    await removeStoredImage(photoUrl);
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
 }));
@@ -1356,12 +1432,16 @@ app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_ad
   const { fullName, photoDataUrl, classId } = req.body;
   let photoUrl;
   try {
-    photoUrl = photoDataUrl !== undefined ? normalizePhotoDataUrl(photoDataUrl) : undefined;
+    photoUrl = photoDataUrl !== undefined ? await storeImage(photoDataUrl, { schoolId: req.school.id, folder: 'staff' }) : undefined;
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
   if (fullName?.trim()) await db.prepare('UPDATE users SET full_name=? WHERE id=?').run(fullName.trim(), req.params.id);
-  if (photoUrl !== undefined) await db.prepare('UPDATE users SET photo_url=? WHERE id=?').run(photoUrl, req.params.id);
+  if (photoUrl !== undefined) {
+    const previous = (await db.prepare('SELECT photo_url FROM users WHERE id=?').get(req.params.id))?.photo_url;
+    await db.prepare('UPDATE users SET photo_url=? WHERE id=?').run(photoUrl, req.params.id);
+    await removeStoredImage(previous);
+  }
   if (classId !== undefined) {
     await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=?`).run(req.params.id, req.school.id);
     if (classId) {
@@ -1422,11 +1502,13 @@ async function restoreFormerStaff(userId, schoolId, { fullName, password, photoU
   const [keep, ...others] = here;
   for (const other of others) await db.prepare('DELETE FROM memberships WHERE id=?').run(other.id);
   await db.prepare(`UPDATE memberships SET status='ACTIVE', role=?, campus_id=? WHERE id=?`).run(roleConfig.membershipRole, campusId, keep.id);
+  const replacedPhoto = photoUrl ? (await db.prepare('SELECT photo_url FROM users WHERE id=?').get(userId))?.photo_url : null;
   await db.prepare(`
     UPDATE users SET full_name=?, password_hash=COALESCE(?, password_hash), role=?, active=1, photo_url=COALESCE(?, photo_url),
       mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL
     WHERE id=?`).run(fullName.trim(), password ? passwordHash(String(password)) : null, roleConfig.userRole, photoUrl, userId);
   await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(userId);
+  return replacedPhoto; // the caller deletes it from storage once the change is saved
 }
 
 app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), audited('STAFF_CREATED', (req, body) => ({ targetType: 'user', targetId: body?.id })), asyncRoute(async (req, res) => {
@@ -1437,7 +1519,7 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
   let photoUrl, initial;
   try {
     initial = initialPassword(password);
-    photoUrl = normalizePhotoDataUrl(photoDataUrl); // optional — photo is never required
+    parseImageDataUrl(photoDataUrl); // optional — photo is never required
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
@@ -1447,12 +1529,13 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
     if (!assignedClass) return res.status(400).json({ error: 'That classroom does not belong to this school' });
   }
   try {
-    const { userId, restored } = await withTransaction(async () => {
+    photoUrl = await storeImage(photoDataUrl, { schoolId: req.school.id, folder: 'staff' });
+    const { userId, restored, replacedPhoto } = await withTransaction(async () => {
       const existing = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
       if (existing) {
-        await restoreFormerStaff(existing.id, req.school.id, { fullName, password, photoUrl, roleConfig, campusId: assignedClass?.campusId || null });
+        const replaced = await restoreFormerStaff(existing.id, req.school.id, { fullName, password, photoUrl, roleConfig, campusId: assignedClass?.campusId || null });
         if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(existing.id, assignedClass.id);
-        return { userId: existing.id, restored: true };
+        return { userId: existing.id, restored: true, replacedPhoto: replaced };
       }
       const userId = id('staff');
       await db.prepare(`INSERT INTO users (id,full_name,email,password_hash,needs_password_setup,photo_url,role) VALUES (?,?,?,?,?,?,?)`)
@@ -1462,6 +1545,8 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
       if (assignedClass) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(userId, assignedClass.id);
       return { userId, restored: false };
     });
+    photoUrl = null; // saved with the account: nothing to clean up if a later step fails
+    await removeStoredImage(replacedPhoto);
     if (restored) {
       await endAllSessions(userId);
       res.locals.audit = { details: { role, email: email.trim(), classId: assignedClass?.id ?? null, returningStaff: true } };
@@ -1479,6 +1564,7 @@ app.post('/api/admin/staff', requireAuth, requireSchoolAccess('school_admin'), a
     }
     res.status(201).json({ id: userId, restored, ...invite });
   } catch (error) {
+    await removeStoredImage(photoUrl);
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already in use.' : error.message });
   }
 }));
@@ -1544,11 +1630,12 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
   let addedExistingGuardian = null;
   let photoUrl;
   try {
-    photoUrl = normalizePhotoDataUrl(photoDataUrl);
+    parseImageDataUrl(photoDataUrl);
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
   try {
+    photoUrl = await storeImage(photoDataUrl, { schoolId: req.school.id, folder: 'students' });
     const studentId = await withTransaction(async () => {
       if (!guardianId && guardian?.email) {
         const existing = await db.prepare(`SELECT gu.id,u.id AS user_id FROM guardians gu JOIN users u ON u.id=gu.user_id WHERE LOWER(u.email)=LOWER(?)`).get(guardian.email.trim());
@@ -1577,6 +1664,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
       if (guardianId) await db.prepare(`INSERT INTO student_guardians (student_id,guardian_id,relationship,is_primary,can_pick_up,can_manage) VALUES (?,?,?,1,?,1)`).run(studentId, guardianId, guardian.relationship || 'Guardian', guardian.canPickUp === false ? 0 : 1);
       return studentId;
     });
+    photoUrl = null; // saved with the student: nothing to clean up if the invite fails
     let invite = {};
     if (createdGuardianAccount) {
       invite = await inviteNewAccount({ userId: createdGuardianAccount, to: guardian.email.trim(), fullName: guardian.fullName.trim(), schoolName: req.school.name, roleLabel: 'a parent or guardian' });
@@ -1586,6 +1674,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
     }
     res.status(201).json({ id: studentId, ...invite });
   } catch (error) {
+    await removeStoredImage(photoUrl);
     res.status(400).json({ error: isUniqueViolation(error) ? 'Student number or guardian email already exists' : error.message });
   }
 }));

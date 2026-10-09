@@ -15,6 +15,8 @@ export function configWarnings(env = process.env) {
   if (!env.PUBLIC_APP_URL || /localhost|127\.0\.0\.1/.test(env.PUBLIC_APP_URL)) warnings.push({ setting: 'PUBLIC_APP_URL', severity: 'high', message: 'Links in emails won\'t point at the live website. Set it to https://www.sdpmplus.com.' });
   if (env.PUBLIC_APP_URL && !env.PUBLIC_APP_URL.startsWith('https://')) warnings.push({ setting: 'PUBLIC_APP_URL', severity: 'medium', message: 'Links in emails should use https://.' });
   if (smtp.some(name => !env[name])) warnings.push({ setting: 'SMTP_*', severity: 'high', message: 'Email sending is not fully set up, so invites, password resets and alerts are not emailed.' });
+  if (!env.AWS_S3_BUCKET) warnings.push({ setting: 'AWS_S3_BUCKET', severity: 'medium', message: 'File storage is not set up, so photos and school logos are saved inside the database. Set AWS_S3_BUCKET, AWS_REGION and the AWS access keys.' });
+  else if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) warnings.push({ setting: 'AWS_ACCESS_KEY_ID', severity: 'high', message: 'A storage bucket is set but the AWS access keys are missing, so photos and logos cannot be saved or shown.' });
   if (env.PGSSL === 'false') warnings.push({ setting: 'PGSSL', severity: 'high', message: 'The database connection is not encrypted.' });
   if (!env.TRUST_PROXY && !env.RAILWAY_ENVIRONMENT) warnings.push({ setting: 'TRUST_PROXY', severity: 'medium', message: 'HTTPS is not enforced unless the server knows it is behind a TLS proxy.' });
   return warnings;

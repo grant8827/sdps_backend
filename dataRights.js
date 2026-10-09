@@ -1,4 +1,5 @@
 import { db, withTransaction } from './db.js';
+import { imageAsDataUrl, removeStoredImage } from './storage.js';
 import { writeAudit } from './audit.js';
 
 // Data export, permanent deletion and retention — the tools a school
@@ -6,7 +7,8 @@ import { writeAudit } from './audit.js';
 // its own retention policy / contract.
 //
 // Never exported: password hashes, two-step verification secrets,
-// recovery codes, sessions, or pickup codes.
+// recovery codes or sessions. (Pickup history keeps `verification` /
+// `overrideReason` for pickups released while a one-time code was in use.)
 
 const utcDaysAgo = days => `to_char((now() - interval '${Number(days)} days') AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')`;
 
@@ -19,6 +21,8 @@ export async function buildStudentExport(studentId, schoolId) {
     FROM students s LEFT JOIN campuses cp ON cp.id=s.campus_id
     WHERE s.id=? AND s.school_id=?`).get(studentId, schoolId);
   if (!student) return null;
+  // The export stands on its own: the photo itself, not a link that stops working.
+  student.photoUrl = await imageAsDataUrl(student.photoUrl);
   const [enrollments, guardians, guardianRequests, attendance, pickupHistory, auditTrail] = await Promise.all([
     db.prepare(`
       SELECT y.name AS "schoolYear", g.name AS grade, c.name AS class, c.room_name AS room, t.full_name AS teacher, e.status
@@ -127,9 +131,11 @@ export async function legalHold(schoolId) {
 export async function permanentlyDeleteStudent(studentId, schoolId) {
   const hold = await legalHold(schoolId);
   if (hold) throw new LegalHoldError(hold);
-  return withTransaction(async () => {
-    const student = await db.prepare(`SELECT id FROM students WHERE id=? AND school_id=? AND status='ARCHIVED' FOR UPDATE`).get(studentId, schoolId);
+  let photo = null;
+  const counts = await withTransaction(async () => {
+    const student = await db.prepare(`SELECT id, photo_url FROM students WHERE id=? AND school_id=? AND status='ARCHIVED' FOR UPDATE`).get(studentId, schoolId);
     if (!student) return null;
+    photo = student.photo_url;
     const counts = {};
     counts.guardianRequests = (await db.prepare('DELETE FROM guardian_requests WHERE student_id=?').run(studentId)).changes;
     counts.attendanceRecords = (await db.prepare('DELETE FROM attendance_records WHERE student_id=?').run(studentId)).changes;
@@ -141,6 +147,9 @@ export async function permanentlyDeleteStudent(studentId, schoolId) {
     await db.prepare('DELETE FROM students WHERE id=?').run(studentId);
     return counts;
   });
+  // The photo file goes too, once the record is really gone.
+  if (counts) await removeStoredImage(photo);
+  return counts;
 }
 
 // ---- Retention -------------------------------------------------------

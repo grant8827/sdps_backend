@@ -353,70 +353,127 @@ test('a rejected adult never gets linked, and the request is kept as history', a
   assert.equal(history.decidedByName, 'Alex Admin');
 });
 
-test('a pickup needs the one-time code from the requesting parent\'s phone', async () => {
+const MORGAN_PIN = '482913';
+
+test('a pickup needs the parent\'s own 6-digit PIN, created the first time; a drop-off does not', async () => {
   await db.prepare(`UPDATE campuses SET latitude=40, longitude=-74 WHERE id=(SELECT campus_id FROM students WHERE id='child-3')`).run();
   await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
   const parent = await login('morgan@school.test', 'password');
-  const requested = await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 });
+  const here = { latitude: 40, longitude: -74 };
+  const pickUp = pin => apiCall('POST', '/me/students/child-3/pick-up', parent.token, { ...here, ...(pin === undefined ? {} : { pin }) });
+
+  // No PIN yet: the pickup is refused with a code the apps use to show "Create your PIN".
+  assert.deepEqual(await (await apiCall('GET', '/me/pin', parent.token)).json(), { hasPin: false });
+  const noPin = await pickUp();
+  assert.equal(noPin.status, 428);
+  assert.equal((await noPin.json()).code, 'PIN_NOT_SET');
+
+  // Creating one: 6 digits, not an obvious one.
+  const create = pin => apiCall('POST', '/me/pin', parent.token, { pin });
+  for (const bad of ['12345', '1234567', 'abcdef', '000000', '123456', 482913]) assert.equal((await create(bad)).status, 400, String(bad));
+  assert.equal((await create(MORGAN_PIN)).status, 204);
+  assert.equal((await create('771904')).status, 409, 'a second "create" can\'t replace it');
+  assert.deepEqual(await (await apiCall('GET', '/me/pin', parent.token)).json(), { hasPin: true });
+  const stored = await db.prepare(`SELECT pickup_pin_hash FROM users WHERE id='parent-2'`).get();
+  assert.match(stored.pickup_pin_hash, /^scrypt\$/);
+  assert.ok(!stored.pickup_pin_hash.includes(MORGAN_PIN));
+
+  // Missing or wrong PIN: refused, with tries left; nothing is requested.
+  assert.equal((await pickUp()).status, 403);
+  const wrong = await pickUp('111222');
+  assert.equal(wrong.status, 403);
+  assert.deepEqual({ ...(await wrong.json()), error: undefined }, { code: 'PIN_WRONG', triesLeft: 3, error: undefined });
+  assert.equal((await db.prepare(`SELECT pickup_status FROM students WHERE id='child-3'`).get()).pickup_status, 'PRESENT');
+  assert.ok(await waitForAudit(`action='PICKUP_PIN_FAILED' AND actor_user_id='parent-2'`, []));
+
+  // The right PIN: requested, and recorded as PIN-verified. A correct PIN clears the wrong-try count.
+  const requested = await pickUp(MORGAN_PIN);
   assert.equal(requested.status, 201);
-  const { id: queueId, pickupCode } = await requested.json();
-  assert.match(pickupCode, /^\d{6}$/);
+  const requestText = await requested.text();
+  assert.ok(!requestText.includes(MORGAN_PIN));
+  const queueId = JSON.parse(requestText).id;
+  assert.equal((await db.prepare('SELECT verification_method FROM queue_items WHERE id=?').get(queueId)).verification_method, 'PIN');
+  assert.equal(await db.prepare(`SELECT 1 FROM rate_limits WHERE key='pin:parent-2'`).get(), undefined);
 
-  // Only the requesting adult sees the code — not the child's other guardians.
-  const children = await (await apiCall('GET', '/me/students', parent.token)).json();
-  assert.equal(children.find(c => c.id === 'child-3').pickupCode, pickupCode);
-  const grandma = await db.prepare(`SELECT u.email FROM student_guardians sg JOIN guardians gu ON gu.id=sg.guardian_id JOIN users u ON u.id=gu.user_id WHERE sg.student_id='child-3' AND u.id<>'parent-2' AND u.email LIKE 'grandma-%'`).get();
-  const other = await login(grandma.email, 'temporary-123');
-  assert.equal((await (await apiCall('GET', '/me/students', other.token)).json()).find(c => c.id === 'child-3').pickupCode, null);
-
-  // The teacher's queue says a code is needed but never shows it.
+  // The teacher just confirms; there is nothing to type.
   const teacher = await login('jordan@school.test', 'password');
   const queued = (await (await apiCall('GET', '/teacher/queue', teacher.token)).json()).find(item => item.id === queueId);
-  assert.equal(queued.requiresCode, true);
-  assert.equal(JSON.stringify(queued).includes(pickupCode), false);
+  assert.ok(queued);
+  const otherTeacher = await login('teacher@school.test', 'password');
+  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, otherTeacher.token)).status, 403);
+  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token)).status, 204);
+  assert.equal((await db.prepare(`SELECT pickup_status FROM students WHERE id='child-3'`).get()).pickup_status, 'PICKED_UP');
 
-  const wrongCode = pickupCode === '000000' ? '111111' : '000000';
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, {})).status, 422);
-  const wrong = await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { code: wrongCode });
-  assert.equal(wrong.status, 422);
-  assert.match((await wrong.json()).error, /3 tries left/);
-  assert.ok(await waitForAudit(`action='PICKUP_CODE_REJECTED' AND details LIKE ?`, [`%${queueId}%`]));
-  // A teacher can't skip the code.
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { overrideReason: 'trust me' })).status, 403);
+  // Drop-off needs no PIN.
+  await db.prepare(`UPDATE students SET pickup_status='AT_HOME' WHERE id='child-3'`).run();
+  const dropOff = await apiCall('POST', '/me/students/child-3/drop-off', parent.token, here);
+  assert.equal(dropOff.status, 201);
+  await apiCall('POST', `/queue/${(await dropOff.json()).id}/approve`, teacher.token);
 
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { code: pickupCode })).status, 204);
-  const done = await db.prepare(`SELECT status, pickup_code, verification_method FROM queue_items WHERE id=?`).get(queueId);
-  assert.deepEqual(done, { status: 'APPROVED', pickup_code: null, verification_method: 'CODE' });
-  const entry = await waitForAudit(`action='PICKUP_ACCEPTED' AND details LIKE ?`, [`%${queueId}%`]);
-  assert.match(entry.details, /"verificationMethod":"CODE"/);
+  // The PIN is in no audit entry, and only parents have one.
+  const leaked = await db.prepare(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE details LIKE ?`).get(`%${MORGAN_PIN}%`);
+  assert.equal(leaked.n, 0);
+  assert.equal((await apiCall('GET', '/me/pin', teacher.token)).status, 403);
+  assert.equal((await apiCall('POST', '/me/pin', teacher.token, { pin: '771904' })).status, 403);
 });
 
-test('an admin can release a child without the code only by giving a reason', async () => {
+test('five wrong PINs lock pickup requests for a while; changing the PIN needs the current one', async () => {
   await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
   const parent = await login('morgan@school.test', 'password');
-  const { id: queueId } = await (await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 })).json();
-  const admin = await login('admin@school.test', 'password');
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, admin.token, { overrideReason: 'Phone battery dead; checked driver\'s license' })).status, 204);
-  const done = await db.prepare(`SELECT verification_method, override_reason FROM queue_items WHERE id=?`).get(queueId);
-  assert.deepEqual(done, { verification_method: 'ADMIN_OVERRIDE', override_reason: 'Phone battery dead; checked driver\'s license' });
-  const entry = await waitForAudit(`action='PICKUP_ACCEPTED' AND details LIKE ?`, [`%${queueId}%`]);
-  assert.match(entry.details, /ADMIN_OVERRIDE/);
-});
+  const pickUp = pin => apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74, pin });
 
-test('too many wrong pickup codes cancel the request', async () => {
-  await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
-  const parent = await login('morgan@school.test', 'password');
-  const { id: queueId, pickupCode } = await (await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 })).json();
-  const wrongCode = pickupCode === '000000' ? '111111' : '000000';
-  const teacher = await login('jordan@school.test', 'password');
-  for (let attempt = 1; attempt < 5; attempt++) {
-    assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { code: wrongCode })).status, 422);
-  }
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { code: wrongCode })).status, 409);
-  assert.equal((await db.prepare(`SELECT status FROM queue_items WHERE id=?`).get(queueId)).status, 'CANCELLED');
+  // Changing: wrong current PIN is refused (and counts as a wrong try); weak new PIN is refused.
+  const change = (currentPin, newPin) => apiCall('POST', '/me/pin/change', parent.token, { currentPin, newPin });
+  assert.equal((await change('999888', '771904')).status, 403);
+  assert.equal((await change(MORGAN_PIN, '111111')).status, 400);
+  assert.equal((await change(MORGAN_PIN, MORGAN_PIN)).status, 400);
+  assert.equal((await change(MORGAN_PIN, '771904')).status, 204);
+  assert.equal((await pickUp(MORGAN_PIN)).status, 403, 'the old PIN no longer works');
+  assert.ok(await waitForAudit(`action='PICKUP_PIN_CHANGED' AND actor_user_id='parent-2'`, []));
+
+  // Four more wrong tries (five in all) lock it — even the right PIN is refused until the window passes.
+  for (let i = 0; i < 3; i++) assert.equal((await pickUp('000111')).status, 403);
+  const fifth = await pickUp('000111');
+  assert.equal(fifth.status, 429);
+  assert.equal((await fifth.json()).code, 'PIN_LOCKED');
+  assert.equal((await pickUp('771904')).status, 429);
+  assert.equal((await db.prepare(`SELECT count FROM rate_limits WHERE key='pin:parent-2'`).get()).count, 5, 'counted in the shared table');
+  assert.ok(await waitForAudit(`action='PICKUP_PIN_LOCKED_OUT' AND actor_user_id='parent-2'`, []));
   assert.equal((await db.prepare(`SELECT pickup_status FROM students WHERE id='child-3'`).get()).pickup_status, 'PRESENT');
-  // The right code no longer works either.
-  assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token, { code: pickupCode })).status, 404);
+});
+
+test('Forgot PIN emails a one-time link that sets a new PIN and nothing else', async () => {
+  const { createAccountLink } = await import('../accountLinks.js');
+  const parent = await login('morgan@school.test', 'password');
+  // No email server in tests: the request is refused clearly rather than pretending it was sent.
+  const forgot = await apiCall('POST', '/me/pin/forgot', parent.token);
+  assert.equal(forgot.status, 503);
+  assert.equal((await forgot.json()).code, 'EMAIL_NOT_SENT');
+  const logged = await db.prepare(`SELECT args FROM notification_deliveries WHERE template='pinReset' ORDER BY created_at DESC LIMIT 1`).get();
+  assert.doesNotMatch(logged.args, /set-pin|token/);
+
+  const pinLink = await createAccountLink('parent-2', 'PIN_RESET');
+  assert.match(pinLink, /\/set-pin\?token=/);
+  const pinToken = new URL(pinLink).searchParams.get('token');
+  assert.equal((await (await apiCall('POST', '/auth/account-link', null, { token: pinToken })).json()).purpose, 'PIN_RESET');
+  // A PIN link can't set a password, and a password link can't set a PIN.
+  assert.equal((await apiCall('POST', '/auth/set-password', null, { token: pinToken, password: 'new-password-123' })).status, 404);
+  const passwordToken = new URL(await createAccountLink('parent-2', 'RESET')).searchParams.get('token');
+  assert.equal((await apiCall('POST', '/auth/set-pin', null, { token: passwordToken, pin: MORGAN_PIN })).status, 404);
+
+  assert.equal((await apiCall('POST', '/auth/set-pin', null, { token: pinToken, pin: '123456' })).status, 400);
+  assert.equal((await apiCall('POST', '/auth/set-pin', null, { token: pinToken, pin: MORGAN_PIN })).status, 204);
+  assert.equal((await apiCall('POST', '/auth/set-pin', null, { token: pinToken, pin: '771904' })).status, 404, 'a link works once');
+  assert.ok(await waitForAudit(`action='PICKUP_PIN_RESET' AND target_id='parent-2'`, []));
+  assert.ok((await login('morgan@school.test', 'password'))?.token, 'the password is untouched and they stay signed in');
+  assert.equal((await apiCall('GET', '/me/pin', parent.token)).status, 200);
+
+  // Resetting also lifts the lockout from the previous test: the new PIN works straight away.
+  await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
+  const requested = await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74, pin: MORGAN_PIN });
+  assert.equal(requested.status, 201);
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE id=?`).run((await requested.json()).id);
+  await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
 });
 
 test('admins must set up two-step verification, then need a code to sign in', async () => {
@@ -712,7 +769,7 @@ test('a suspended location refuses drop-off and pick-up until reactivated', asyn
   assert.match((await paused.json()).error, /paused/);
 
   assert.equal((await apiCall('POST', `/admin/campuses/${campusId}/status`, admin.token, { active: true })).status, 204);
-  assert.equal((await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74 })).status, 201);
+  assert.equal((await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { latitude: 40, longitude: -74, pin: MORGAN_PIN })).status, 201);
 });
 
 test('new accounts choose their own password through an emailed invite link', async () => {
@@ -824,7 +881,7 @@ test('a School B admin cannot read or change any School A record by id, however 
     ['POST', '/admin/members/parent-1/send-link'],
     ['POST', '/attendance', { studentId: 'child-1', date: '2026-01-05', status: 'ABSENT' }],
     ['GET', '/admin/attendance?classId=class-1'],
-    ['POST', '/queue/queue-a/approve', { overrideReason: 'trying' }],
+    ['POST', '/queue/queue-a/approve'],
     ['POST', '/queue/queue-a/decline'],
     ['PATCH', `/admin/campuses/${campusA}`, { name: 'Taken' }],
   ];
@@ -1052,12 +1109,14 @@ test('the platform dashboard counts today\'s activity across schools, for platfo
   const before = await (await apiCall('GET', '/superadmin/dashboard?refresh=1', superAdmin.token)).json();
   const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const localToday = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
-  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,approved_at,verification_method) VALUES ('dash-pickup','school-default','child-2','PICK_UP','parent-1','APPROVED',?,'ADMIN_OVERRIDE')`).run(nowUtc);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,approved_at) VALUES ('dash-pickup','school-default','child-2','PICK_UP','parent-1','APPROVED',?)`).run(nowUtc);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,declined_at,declined_by_user_id) VALUES ('dash-declined','school-default','child-2','DROP_OFF','parent-1','DECLINED',?,'teacher-1')`).run(nowUtc);
   await db.prepare(`INSERT INTO attendance_records (id,school_id,student_id,date,status) VALUES ('dash-att','school-b','student-b',?,'PRESENT') ON CONFLICT (student_id,date) DO NOTHING`).run(localToday);
 
   const after = await (await apiCall('GET', '/superadmin/dashboard?refresh=1', superAdmin.token)).json();
   assert.equal(after.operations.pickUps, before.operations.pickUps + 1);
-  assert.equal(after.operations.overrides, before.operations.overrides + 1);
+  assert.equal(after.operations.declined, before.operations.declined + 1);
+  assert.equal('overrides' in after.operations, false);
   assert.equal(after.operations.exceptions, before.operations.exceptions + 1);
   assert.ok(after.operations.present >= 1);
   assert.equal(after.daily.length, 30);
@@ -1084,7 +1143,7 @@ test('Needs Attention lists real problems with links, and says what it does not 
   assert.ok(setup && setup.link === `/platform/schools/${oakValley}`);
   assert.match(setup.detail, /no location mapped/);
   assert.ok(ids.includes('locked-accounts'), 'an earlier test locked an account name');
-  assert.ok(ids.includes(`override-school-default`));
+  assert.ok(ids.every(itemId => !itemId.startsWith('override-') && !itemId.startsWith('pickup-lockout-')), 'pickup-code items are gone');
   assert.ok(result.items.every(item => item.link === null || item.link.startsWith('/platform/')));
   assert.equal(result.items[0].severity, 'critical');
   assert.ok(result.notTracked.length > 0);
@@ -1114,11 +1173,11 @@ test('school detail tabs show people and children without credentials, and every
   assert.equal((await apiCall('GET', '/superadmin/schools/school-default/students', billing.token)).status, 403);
   assert.equal((await apiCall('GET', '/superadmin/schools/school-default/users', billing.token)).status, 403);
 
-  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,pickup_code) VALUES ('ops-secret','school-default','child-3','PICK_UP','parent-1','SECRET9')`).run();
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id) VALUES ('ops-secret','school-default','child-3','PICK_UP','parent-1')`).run();
   const ops = await (await apiCall('GET', '/superadmin/schools/school-default/operations', superAdmin.token)).text();
-  assert.doesNotMatch(ops, /SECRET9|pickup_code|pickupCode/);
+  assert.doesNotMatch(ops, /pickup_code|pickupCode|verificationMethod/);
   assert.ok(JSON.parse(ops).today.pending >= 1);
-  await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL WHERE id='ops-secret'`).run();
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE id='ops-secret'`).run();
 
   const attendance = await (await apiCall('GET', '/superadmin/schools/school-b/attendance', superAdmin.token)).json();
   assert.equal(attendance.days.length, 14);
@@ -1134,7 +1193,7 @@ test('school detail tabs show people and children without credentials, and every
 test('live operations show each school\'s waiting requests, oldest first, with children named only as "First L."', async () => {
   const superAdmin = await login('super-1@test.local', 'password');
   const fortyMinutesAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,requested_at,pickup_code) VALUES ('ops-wait-b','school-b','student-b','PICK_UP','admin-b',?,'CODE77')`).run(fortyMinutesAgo);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,requested_at) VALUES ('ops-wait-b','school-b','student-b','PICK_UP','admin-b',?)`).run(fortyMinutesAgo);
 
   const schools = await (await apiCall('GET', '/superadmin/operations/schools', superAdmin.token)).json();
   const schoolB = schools.items.find(sc => sc.id === 'school-b');
@@ -1144,7 +1203,7 @@ test('live operations show each school\'s waiting requests, oldest first, with c
 
   const waiting = await apiCall('GET', '/superadmin/operations/requests?state=waiting&schoolId=school-b', superAdmin.token);
   const body = await waiting.text();
-  assert.doesNotMatch(body, /CODE77|pickup_code|Private Student/);
+  assert.doesNotMatch(body, /pickup_code|pickupCode|Private Student/);
   const item = JSON.parse(body).items.find(i => i.id === 'ops-wait-b');
   assert.equal(item.studentName, 'Private S.');
   assert.ok(item.waitMinutes >= 39);
@@ -1158,7 +1217,7 @@ test('live operations show each school\'s waiting requests, oldest first, with c
   }
   const billing = await login('billing-1@test.local', 'password');
   assert.equal((await apiCall('GET', '/superadmin/operations/requests', billing.token)).status, 403, 'billing admins have no pickup:view');
-  await db.prepare(`UPDATE queue_items SET status='CANCELLED', pickup_code=NULL WHERE id='ops-wait-b'`).run();
+  await db.prepare(`UPDATE queue_items SET status='CANCELLED' WHERE id='ops-wait-b'`).run();
 });
 
 test('attendance by school for a day counts present, late, absent and not marked', async () => {
@@ -1172,35 +1231,38 @@ test('attendance by school for a day counts present, late, absent and not marked
   assert.ok(result.totals.present >= 1);
 });
 
-test('incidents list overrides and wrong-code lockouts, and can be marked reviewed once, with a note', async () => {
+test('incidents list declined requests, and can be marked reviewed once, with a note', async () => {
   const superAdmin = await login('super-1@test.local', 'password');
   const nowUtc = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,approved_at,approved_by_user_id,verification_method,override_reason) VALUES ('incident-override','school-default','child-1','PICK_UP','parent-1','APPROVED',?,'admin-1','ADMIN_OVERRIDE','Parent phone dead, ID checked')`).run(nowUtc);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,request_type,requested_by_user_id,status,declined_at,declined_by_user_id) VALUES ('incident-declined','school-default','child-1','PICK_UP','parent-1','DECLINED',?,'teacher-1')`).run(nowUtc);
 
   const open = await (await apiCall('GET', '/superadmin/operations/incidents', superAdmin.token)).json();
-  const override = open.items.find(i => i.key === 'override:incident-override');
-  assert.ok(override);
-  assert.equal(override.reason, 'Parent phone dead, ID checked');
-  assert.match(override.studentName, /^\S+ \S\.$/);
-  assert.ok(open.items.some(i => i.type === 'WRONG_CODE_LOCKOUT'), 'the wrong-code test earlier cancelled a pickup');
-  const onlyOverrides = await (await apiCall('GET', '/superadmin/operations/incidents?type=ADMIN_OVERRIDE&schoolId=school-default', superAdmin.token)).json();
-  assert.ok(onlyOverrides.items.length >= 1 && onlyOverrides.items.every(i => i.type === 'ADMIN_OVERRIDE' && i.schoolId === 'school-default'));
+  const declined = open.items.find(i => i.key === 'declined:incident-declined');
+  assert.ok(declined);
+  assert.equal(declined.type, 'REQUEST_DECLINED');
+  assert.equal(declined.requestType, 'PICK_UP');
+  assert.match(declined.studentName, /^\S+ \S\.$/);
+  assert.ok(declined.actorName);
+  assert.ok(open.items.every(i => i.type === 'REQUEST_DECLINED'), 'pickup-code incidents are gone');
+  const oneSchool = await (await apiCall('GET', '/superadmin/operations/incidents?type=REQUEST_DECLINED&schoolId=school-default', superAdmin.token)).json();
+  assert.ok(oneSchool.items.length >= 1 && oneSchool.items.every(i => i.schoolId === 'school-default'));
   assert.equal((await apiCall('GET', '/superadmin/operations/incidents?from=2026-05-02&to=2026-05-01', superAdmin.token)).status, 400);
 
   const review = body => apiCall('POST', '/superadmin/operations/incidents/review', superAdmin.token, body);
-  assert.equal((await review({ key: 'override:incident-override' })).status, 400, 'a note is required');
-  assert.equal((await review({ key: 'override:no-such-item', note: 'Checked with school' })).status, 404);
-  assert.equal((await review({ key: 'override:incident-override', note: 'Called the school; ID was checked' })).status, 204);
-  assert.equal((await review({ key: 'override:incident-override', note: 'Again' })).status, 409);
+  assert.equal((await review({ key: 'declined:incident-declined' })).status, 400, 'a note is required');
+  assert.equal((await review({ key: 'declined:no-such-item', note: 'Checked with school' })).status, 404);
+  assert.equal((await review({ key: 'override:incident-declined', note: 'Old kind of incident' })).status, 404);
+  assert.equal((await review({ key: 'declined:incident-declined', note: 'Called the school; wrong adult at the gate' })).status, 204);
+  assert.equal((await review({ key: 'declined:incident-declined', note: 'Again' })).status, 409);
   const stillOpen = await (await apiCall('GET', '/superadmin/operations/incidents', superAdmin.token)).json();
-  assert.ok(stillOpen.items.every(i => i.key !== 'override:incident-override'));
+  assert.ok(stillOpen.items.every(i => i.key !== 'declined:incident-declined'));
   const reviewed = await (await apiCall('GET', '/superadmin/operations/incidents?state=reviewed', superAdmin.token)).json();
-  const done = reviewed.items.find(i => i.key === 'override:incident-override');
-  assert.equal(done.reviewNote, 'Called the school; ID was checked');
+  const done = reviewed.items.find(i => i.key === 'declined:incident-declined');
+  assert.equal(done.reviewNote, 'Called the school; wrong adult at the gate');
   assert.equal(done.reviewedBy, 'Platform SUPER_ADMIN');
-  const entry = await waitForAudit(`action='INCIDENT_REVIEWED' AND target_id='incident-override'`, []);
+  const entry = await waitForAudit(`action='INCIDENT_REVIEWED' AND target_id='incident-declined'`, []);
   assert.equal(entry.school_id, 'school-default');
-  assert.equal(entry.reason, 'Called the school; ID was checked');
+  assert.equal(entry.reason, 'Called the school; wrong adult at the gate');
 });
 
 // ---- Phase 4: Security Center and Compliance Center ------------------------------------------
@@ -1527,6 +1589,143 @@ test('production settings that are unsafe are flagged without printing their val
   const clean = configWarnings({
     RAILWAY_ENVIRONMENT: 'production', MFA_ENCRYPTION_KEY: 'k', PUBLIC_APP_URL: 'https://www.sdpmplus.com',
     SMTP_HOST: 'h', SMTP_PORT: '587', SMTP_USER: 'u', SMTP_PASSWORD: 'p', SMTP_FROM: 'f',
+    AWS_S3_BUCKET: 'b', AWS_ACCESS_KEY_ID: 'a', AWS_SECRET_ACCESS_KEY: 's',
   });
   assert.deepEqual(clean, []);
+});
+
+// A real 1x1 PNG, and a text file that only claims to be one.
+const TINY_PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+const FAKE_PNG = `data:image/png;base64,${Buffer.from('<script>alert(1)</script> not an image').toString('base64')}`;
+
+test('a school can register with a logo, and everyone in that school sees it (only theirs)', async () => {
+  const email = `logo-${randomUUID()}@test.local`;
+  const base = { schoolName: 'Logo Academy', campusName: 'Main', adminFullName: 'Logo Admin', email, password: 'password-1' };
+  for (const bad of [FAKE_PNG, 'data:image/svg+xml;base64,PHN2Zy8+', 'data:image/gif;base64,R0lGODlhAQABAAAAACw=', 'https://example.com/logo.png']) {
+    const refused = await apiCall('POST', '/auth/register-school', null, { ...base, logoDataUrl: bad });
+    assert.equal(refused.status, 400, `refused: ${bad.slice(0, 30)}`);
+    assert.match((await refused.json()).error, /Logo must be a PNG, JPEG, or WEBP image/);
+  }
+  assert.equal(await db.prepare('SELECT 1 FROM users WHERE email=?').get(email), undefined, 'a refused logo registers nothing');
+
+  assert.equal((await apiCall('POST', '/auth/register-school', null, { ...base, logoDataUrl: TINY_PNG })).status, 201);
+  const admin = await login(email, 'password-1');
+  const mine = await (await apiCall('GET', '/me/school', admin.token)).json();
+  assert.equal(mine.name, 'Logo Academy');
+  assert.equal(mine.logoUrl, TINY_PNG);
+  assert.equal((await (await apiCall('GET', '/admin/setup', admin.token)).json()).school.logoUrl, TINY_PNG);
+
+  // Parents and teachers of another school see their own school, never this logo.
+  for (const who of ['morgan@school.test', 'teacher@school.test']) {
+    const other = await (await apiCall('GET', '/me/school', (await login(who, 'password')).token)).json();
+    assert.equal(other.name, 'Demo School');
+    assert.equal(other.logoUrl, null);
+  }
+  const crossSchool = await fetch(`${apiBaseUrl}/api/me/school`, { headers: { Authorization: `Bearer ${(await login('morgan@school.test', 'password')).token}`, 'X-School-ID': mine.id } });
+  assert.equal(crossSchool.status, 403);
+  assert.equal((await apiCall('GET', '/me/school')).status, 401);
+
+  // Only an administrator changes it; '' removes it.
+  assert.equal((await apiCall('PATCH', '/admin/school', (await login('teacher@school.test', 'password')).token, { logoDataUrl: TINY_PNG })).status, 403);
+  assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { logoDataUrl: FAKE_PNG })).status, 400);
+  assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { name: 'Logo Academy 2' })).status, 204);
+  assert.equal((await (await apiCall('GET', '/me/school', admin.token)).json()).logoUrl, TINY_PNG, 'saving other settings keeps the logo');
+  assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { logoDataUrl: '' })).status, 204);
+  assert.equal((await (await apiCall('GET', '/me/school', admin.token)).json()).logoUrl, null);
+});
+
+test('with S3 storage, images are uploaded privately, served by expiring links, and deleted with their record', async () => {
+  const { createServer } = await import('node:http');
+  // A stand-in for S3: remembers what was put, serves it back, forgets what is deleted.
+  const objects = new Map();
+  const fakeS3 = createServer((req, res) => {
+    const key = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+    if (req.method === 'PUT') {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => { objects.set(key, { body: Buffer.concat(chunks), type: req.headers['content-type'], sse: req.headers['x-amz-server-side-encryption'] }); res.writeHead(200, { ETag: '"x"' }).end(); });
+    } else if (req.method === 'GET') {
+      const object = objects.get(key);
+      // Like the real thing, an unsigned request is refused.
+      if (!/X-Amz-Signature=|AWS4-HMAC-SHA256/.test(req.url + (req.headers.authorization ?? ''))) return res.writeHead(403).end();
+      if (!object) return res.writeHead(404, { 'Content-Type': 'application/xml' }).end('<Error><Code>NoSuchKey</Code></Error>');
+      res.writeHead(200, { 'Content-Type': object.type, 'Content-Length': object.body.length }).end(object.body);
+    } else if (req.method === 'DELETE') { objects.delete(key); res.writeHead(204).end(); } else res.writeHead(405).end();
+  }).listen(0);
+  await new Promise(resolve => fakeS3.once('listening', resolve));
+  const endpoint = `http://127.0.0.1:${fakeS3.address().port}`;
+  const saved = {};
+  for (const [name, value] of Object.entries({ AWS_S3_BUCKET: 'test-bucket', AWS_REGION: 'us-east-1', AWS_S3_ENDPOINT: endpoint, AWS_ACCESS_KEY_ID: 'test', AWS_SECRET_ACCESS_KEY: 'test' })) {
+    saved[name] = process.env[name];
+    process.env[name] = value;
+  }
+  try {
+    const admin = await login('admin@school.test', 'password');
+    const setup = await (await apiCall('GET', '/admin/setup', admin.token)).json();
+    const year = setup.schoolYears.find(y => y.status === 'ACTIVE');
+    const room = setup.classes.find(c => c.schoolYearId === year.id);
+    const child = { firstName: 'Photo', lastName: 'Kid', schoolYearId: year.id, gradeLevelId: room.gradeLevelId, classId: room.id };
+
+    // A refused student leaves nothing behind in the bucket.
+    assert.equal((await apiCall('POST', '/admin/students', admin.token, { ...child, photoDataUrl: FAKE_PNG })).status, 400);
+    assert.equal((await apiCall('POST', '/admin/students', admin.token, { ...child, photoDataUrl: TINY_PNG, guardian: { id: 'guardian-of-nobody' } })).status, 400);
+    assert.equal(objects.size, 0, 'the photo of a student that was not saved is removed');
+
+    const created = await apiCall('POST', '/admin/students', admin.token, { ...child, photoDataUrl: TINY_PNG });
+    assert.equal(created.status, 201);
+    const studentId = (await created.json()).id;
+    const stored = (await db.prepare('SELECT photo_url FROM students WHERE id=?').get(studentId)).photo_url;
+    assert.match(stored, /^s3:\/\/schools\/school-default\/students\/[0-9a-f-]+\.png$/, 'the database holds a reference, not the image');
+    const [[objectPath, object]] = [...objects];
+    assert.equal(objectPath, `/test-bucket/${stored.slice(5)}`);
+    assert.equal(object.type, 'image/png');
+    assert.equal(object.sse, 'AES256');
+    assert.ok(object.body.equals(Buffer.from(TINY_PNG.split(',')[1], 'base64')));
+
+    // The API hands out a signed, expiring link — never the reference.
+    const listText = await (await apiCall('GET', '/admin/students', admin.token)).text();
+    assert.doesNotMatch(listText, /s3:\/\//);
+    const listed = JSON.parse(listText).find(s => s.id === studentId);
+    assert.ok(listed.photoUrl.startsWith(`${endpoint}/test-bucket/schools/school-default/students/`));
+    assert.match(listed.photoUrl, /X-Amz-Expires=3600/);
+    assert.match(listed.photoUrl, /X-Amz-Signature=/);
+    const image = await fetch(listed.photoUrl);
+    assert.equal(image.status, 200);
+    assert.ok(Buffer.from(await image.arrayBuffer()).equals(object.body));
+    assert.equal((await fetch(listed.photoUrl.split('?')[0])).status, 403, 'the plain address does not work');
+    const again = JSON.parse(await (await apiCall('GET', '/admin/students', admin.token)).text()).find(s => s.id === studentId);
+    assert.equal(again.photoUrl, listed.photoUrl, 'the link is stable between requests, so it can be cached');
+    // The page is allowed to load images from the bucket.
+    assert.match((await apiCall('GET', '/health')).headers.get('content-security-policy'), new RegExp(`img-src 'self' data: blob: ${endpoint.replace(/[.]/g, '\\.')}`));
+
+    // An export carries the photo itself.
+    const exported = await (await apiCall('GET', `/admin/students/${studentId}/export`, admin.token)).json();
+    assert.equal(exported.student.photoUrl, TINY_PNG);
+
+    // School logo: uploaded, linked, replaced (old file deleted), removed.
+    assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { logoDataUrl: TINY_PNG })).status, 204);
+    const firstLogo = (await db.prepare(`SELECT logo_url FROM schools WHERE id='school-default'`).get()).logo_url;
+    assert.match(firstLogo, /^s3:\/\/schools\/school-default\/logo\//);
+    const parentView = await (await apiCall('GET', '/me/school', (await login('morgan@school.test', 'password')).token)).json();
+    assert.equal((await fetch(parentView.logoUrl)).status, 200);
+    assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { logoDataUrl: TINY_PNG })).status, 204);
+    assert.equal(objects.has(`/test-bucket/${firstLogo.slice(5)}`), false, 'the replaced logo is deleted');
+    assert.equal(objects.size, 2);
+    assert.equal((await apiCall('PATCH', '/admin/school', admin.token, { logoDataUrl: null })).status, 204);
+    assert.equal(objects.size, 1);
+
+    // Erasing the student erases the photo file.
+    assert.equal((await apiCall('DELETE', `/admin/students/${studentId}`, admin.token)).status, 204);
+    assert.equal((await apiCall('DELETE', `/admin/students/${studentId}/permanent`, admin.token, { confirmName: 'Photo Kid' })).status, 200);
+    assert.equal(objects.size, 0, 'nothing of the student is left in the bucket');
+
+    // Storage being unreachable is a clear message, not a crash or a leak of details.
+    process.env.AWS_S3_ENDPOINT = 'http://127.0.0.1:1';
+    const down = await apiCall('POST', '/admin/students', admin.token, { ...child, firstName: 'Down', photoDataUrl: TINY_PNG });
+    assert.equal(down.status, 400);
+    assert.match((await down.json()).error, /^Photo could not be saved right now/);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    await new Promise(resolve => fakeS3.close(resolve));
+  }
 });

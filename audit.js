@@ -10,9 +10,10 @@ import { pool, id } from './db.js';
 // written after the response has finished, by which point any
 // withTransaction() client the route used may already be released.
 
-// Request-body keys never copied into an entry's details — secrets, and
-// photos (a base64 data URL can be megabytes).
-const OMITTED_KEYS = /password|token|secret|photo/i;
+// Request-body keys never copied into an entry's details — secrets
+// (including pickup PINs: pin, currentPin, newPin), and photos (a base64
+// data URL can be megabytes).
+const OMITTED_KEYS = /password|token|secret|photo|(^|[a-z])pin$/i;
 const MAX_STRING = 200;
 
 export function sanitizeDetails(value, depth = 0) {

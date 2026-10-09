@@ -6,8 +6,8 @@ import { PLATFORM_TZ, daysAgo, localDate, utcBounds } from './platformInsights.j
 
 // Platform → Operations: live drop-offs and pickups across every school,
 // requests still waiting, attendance by school for a day, and incidents
-// (pickups released without the code, pickups cancelled for wrong codes)
-// that a platform admin can mark as reviewed.
+// (requests a teacher or administrator declined) that a platform admin
+// can mark as reviewed.
 //
 // Cross-school lists name a child only as "First L." — enough to talk to
 // a school about a specific request, without spreading full names. Every
@@ -45,25 +45,21 @@ async function todayBounds() {
 
 // ---- incidents ------------------------------------------------------------------
 //
-// One list built from where each kind of exception already lives:
-//   override:<queue item id>  — a pickup released by an admin without the code (queue_items, with the reason given)
-//   lockout:<audit entry id>  — a pickup cancelled after too many wrong codes (audit_logs)
-const INCIDENT_TYPES = ['ADMIN_OVERRIDE', 'WRONG_CODE_LOCKOUT'];
+// A drop-off or pickup request that the school declined:
+//   declined:<queue item id>
+// (Older reviews keyed override:… / lockout:… — from when pickups needed
+// a one-time code — stay in incident_reviews but are no longer listed.)
+const INCIDENT_TYPES = ['REQUEST_DECLINED'];
 
 function incidentsSql() {
   return `
     SELECT incidents.*, r.note AS "reviewNote", r.reviewed_at AS "reviewedAt", ru.full_name AS "reviewedBy" FROM (
-      SELECT 'override:' || qi.id AS key, 'ADMIN_OVERRIDE' AS type, qi.school_id AS "schoolId", s.name AS "schoolName",
-        qi.approved_at AS "occurredAt", u.full_name AS "actorName", ${STUDENT_SHORT_NAME} AS "studentName",
-        qi.override_reason AS reason, qi.request_type AS "requestType"
+      SELECT 'declined:' || qi.id AS key, 'REQUEST_DECLINED' AS type, qi.school_id AS "schoolId", s.name AS "schoolName",
+        qi.declined_at AS "occurredAt", u.full_name AS "actorName", ${STUDENT_SHORT_NAME} AS "studentName",
+        qi.request_type AS "requestType"
       FROM queue_items qi JOIN schools s ON s.id=qi.school_id JOIN students st ON st.id=qi.student_id
-      LEFT JOIN users u ON u.id=qi.approved_by_user_id
-      WHERE qi.verification_method='ADMIN_OVERRIDE' AND qi.approved_at >= $1 AND qi.approved_at < $2
-      UNION ALL
-      SELECT 'lockout:' || a.id, 'WRONG_CODE_LOCKOUT', a.school_id, s.name, a.created_at, a.actor_name,
-        ${STUDENT_SHORT_NAME}, NULL, 'PICK_UP'
-      FROM audit_logs a JOIN schools s ON s.id=a.school_id LEFT JOIN students st ON st.id=a.target_id
-      WHERE a.action='PICKUP_CODE_LOCKED_OUT' AND a.created_at >= $1 AND a.created_at < $2
+      LEFT JOIN users u ON u.id=qi.declined_by_user_id
+      WHERE qi.status='DECLINED' AND qi.declined_at >= $1 AND qi.declined_at < $2
     ) incidents
     LEFT JOIN incident_reviews r ON r.incident_key = incidents.key
     LEFT JOIN users ru ON ru.id = r.reviewed_by_user_id
@@ -88,12 +84,12 @@ export function registerPlatformOperations(router) {
           COUNT(*) FILTER (WHERE status='PENDING' AND request_type='DROP_OFF')::int AS "pendingDropOffs",
           COUNT(*) FILTER (WHERE status='PENDING' AND request_type='PICK_UP')::int AS "pendingPickUps",
           MIN(requested_at) FILTER (WHERE status='PENDING') AS "oldestPendingAt",
-          COUNT(*) FILTER (WHERE verification_method='ADMIN_OVERRIDE' AND approved_at >= $1 AND approved_at < $2)::int AS overrides
-        FROM queue_items WHERE status='PENDING' OR approved_at >= $1 GROUP BY school_id
+          COUNT(*) FILTER (WHERE status='DECLINED' AND declined_at >= $1 AND declined_at < $2)::int AS declined
+        FROM queue_items WHERE status='PENDING' OR approved_at >= $1 OR declined_at >= $1 GROUP BY school_id
       )
       SELECT s.id, s.name, COALESCE(q."dropOffs",0) AS "dropOffs", COALESCE(q."pickUps",0) AS "pickUps",
         COALESCE(q."pendingDropOffs",0) AS "pendingDropOffs", COALESCE(q."pendingPickUps",0) AS "pendingPickUps",
-        q."oldestPendingAt", COALESCE(q.overrides,0) AS overrides
+        q."oldestPendingAt", COALESCE(q.declined,0) AS declined
       FROM schools s LEFT JOIN q ON q.school_id=s.id
       WHERE s.status='ACTIVE' AND ($3::text IS NULL OR s.name ILIKE '%' || $3 || '%')
       -- Longest-waiting request first: that's the school most likely to need a nudge.
@@ -113,15 +109,16 @@ export function registerPlatformOperations(router) {
     const state = ['waiting', 'done'].includes(req.query.state) ? req.query.state : 'waiting';
     const type = ['DROP_OFF', 'PICK_UP'].includes(req.query.type) ? req.query.type : null;
     const params = [start, type, optionalId(req.query.schoolId)];
-    const where = `${state === 'waiting' ? `qi.status='PENDING'` : `qi.status IN ('APPROVED','CANCELLED') AND COALESCE(qi.approved_at, qi.declined_at) >= $1`}
+    const where = `${state === 'waiting' ? `qi.status='PENDING'` : `qi.status IN ('APPROVED','CANCELLED','DECLINED') AND COALESCE(qi.approved_at, qi.declined_at) >= $1`}
       AND ($2::text IS NULL OR qi.request_type = $2) AND ($3::text IS NULL OR qi.school_id = $3) AND $1::text IS NOT NULL`;
     const { rows: [{ total }] } = await pool.query(`SELECT COUNT(*)::int AS total FROM queue_items qi WHERE ${where}`, params);
     const { rows } = await pool.query(`
       SELECT qi.id, qi.school_id AS "schoolId", s.name AS "schoolName", c.name AS "campusName", qi.request_type AS "requestType",
         qi.status, qi.requested_at AS "requestedAt", COALESCE(qi.approved_at, qi.declined_at) AS "closedAt",
-        qi.verification_method AS "verificationMethod", ${STUDENT_SHORT_NAME} AS "studentName", t.full_name AS "teacherName"
+        ${STUDENT_SHORT_NAME} AS "studentName", t.full_name AS "teacherName", cu.full_name AS "closedByName"
       FROM queue_items qi JOIN schools s ON s.id=qi.school_id JOIN students st ON st.id=qi.student_id
       LEFT JOIN campuses c ON c.id=qi.campus_id LEFT JOIN users t ON t.id=qi.teacher_user_id
+      LEFT JOIN users cu ON cu.id=COALESCE(qi.approved_by_user_id, qi.declined_by_user_id)
       WHERE ${where}
       ORDER BY ${state === 'waiting' ? 'qi.requested_at ASC' : 'COALESCE(qi.approved_at, qi.declined_at) DESC'}, qi.id
       LIMIT ${pageSize} OFFSET ${offset}`, params);
@@ -189,11 +186,9 @@ export function registerPlatformOperations(router) {
     const note = typeof req.body.note === 'string' ? req.body.note.trim().slice(0, 500) : '';
     if (note.length < 5) return res.status(400).json({ error: 'Add a note about what was checked (at least 5 characters).' });
     const [kind, id] = key.split(':');
-    const source = kind === 'override'
-      ? await pool.query(`SELECT school_id AS "schoolId" FROM queue_items WHERE id=$1 AND verification_method='ADMIN_OVERRIDE'`, [id])
-      : kind === 'lockout'
-        ? await pool.query(`SELECT school_id AS "schoolId" FROM audit_logs WHERE id=$1 AND action='PICKUP_CODE_LOCKED_OUT'`, [id])
-        : { rows: [] };
+    const source = kind === 'declined'
+      ? await pool.query(`SELECT school_id AS "schoolId" FROM queue_items WHERE id=$1 AND status='DECLINED'`, [id])
+      : { rows: [] };
     const incident = source.rows[0];
     if (!incident) return res.status(404).json({ error: 'Incident not found' });
     const saved = await pool.query(`INSERT INTO incident_reviews (incident_key,school_id,note,reviewed_by_user_id) VALUES ($1,$2,$3,$4) ON CONFLICT (incident_key) DO NOTHING`,
@@ -201,7 +196,7 @@ export function registerPlatformOperations(router) {
     if (saved.rowCount === 0) return res.status(409).json({ error: 'This incident was already reviewed.' });
     await writeAudit({
       schoolId: incident.schoolId, actor: req.user, actorRole: req.platformAdmin.role, action: 'INCIDENT_REVIEWED',
-      targetType: kind === 'override' ? 'queue_item' : 'audit_entry', targetId: id, reason: note, ip: req.ip, requestId: req.requestId,
+      targetType: 'queue_item', targetId: id, reason: note, ip: req.ip, requestId: req.requestId,
     });
     res.status(204).end();
   }));

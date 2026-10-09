@@ -60,7 +60,7 @@ export async function sendEmail({ to, subject, text, html }) {
 // short paragraphs, at most one blue button (with the link also written
 // out for mail clients that hide buttons), and a footer saying who sent
 // it. Inline styles only — most mail clients ignore <style> blocks.
-// Emails never contain a password, a pickup code or a student's details;
+// Emails never contain a password or a student's details;
 // links lead into the app, which checks who's signed in.
 
 const BRAND = { navy: '#123B6D', blue: '#1976D2', slate: '#374151', bg: '#F4F8FC', muted: '#6B7280' };
@@ -198,6 +198,37 @@ export function sendPasswordChangedEmail({ to, fullName, retryOf }) {
   }, log);
 }
 
+/** "Forgot PIN?" — a link to choose a new pickup PIN (valid 1 hour). The link is never logged. */
+export function sendPinResetEmail({ to, fullName, link, retryOf }) {
+  const log = { template: 'pinReset', retryOf, args: { fullName } };
+  return deliver(to, 'Reset your SDPMPlus pickup PIN', {
+    preheader: 'Choose a new pickup PIN. This link expires in 1 hour.',
+    heading: 'Reset your pickup PIN',
+    paragraphs: [
+      `Hello ${fullName},`,
+      'Someone (hopefully you) asked to reset the 6-digit PIN you enter to request a pickup.',
+      'Choose a new PIN with the button below. Your password stays the same.',
+    ],
+    button: { label: 'Choose a new PIN', url: link },
+    footnote: "This link works once and expires in 1 hour. If you didn't ask for it, ignore this email; your PIN stays the same.",
+  }, log);
+}
+
+/** Security notice after the pickup PIN is created, changed or reset. */
+export function sendPinChangedEmail({ to, fullName, retryOf }) {
+  const log = { template: 'pinChanged', retryOf, args: { fullName } };
+  return deliver(to, 'Your SDPMPlus pickup PIN was changed', {
+    heading: 'Your pickup PIN was changed',
+    paragraphs: [
+      `Hello ${fullName},`,
+      'The PIN you enter to request a pickup was just set or changed.',
+      "If this was you, there's nothing else to do.",
+      "If it wasn't, change your password right away and tell your school office.",
+    ],
+    button: { label: 'Reset my password', url: `${appBaseUrl()}/forgot-password` },
+  }, log);
+}
+
 /** Security notice when an administrator cleared someone's two-step verification. */
 export function sendMfaResetEmail({ to, fullName, schoolName, resetBy, retryOf }) {
   const log = { template: 'mfaReset', retryOf, args: { fullName, schoolName, resetBy } };
@@ -254,7 +285,7 @@ export function sendGuardianApprovedEmail({ to, fullName, schoolName, link, retr
     heading: "You're approved for drop-off and pick-up",
     paragraphs: [
       `Hello ${fullName},`,
-      `${schoolName} approved you. You can now drop off and pick up in the SDPMPlus app. Each pickup shows a one-time code on your phone for the teacher to check.`,
+      `${schoolName} approved you. You can now request drop-off and pick-up in the SDPMPlus app when you're at the school.`,
       ...(link ? ["You haven't set up your account yet. Use the button below to choose a password."] : []),
     ],
     button: link ? { label: 'Set up my account', url: link } : { label: 'Sign in', url: `${appBaseUrl()}/login` },

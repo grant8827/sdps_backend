@@ -6,7 +6,7 @@ import { getPlatformAdmin, requirePlatformPermission } from './permissions.js';
 import { PLATFORM_TZ, daysAgo, localDate, utcBounds } from './platformInsights.js';
 
 // Platform reports: usage, drop-offs and pickups, attendance, active
-// users, adoption and exceptions — counts only, never individual
+// users, adoption and exceptions (declined requests) — counts only, never individual
 // children. Each is one aggregate query over a date range of at most a
 // year, optionally for one school. On screen it's paged; "Export CSV"
 // runs the full report as a background job (jobs.js).
@@ -21,7 +21,7 @@ const REPORTS = {
     title: 'School usage',
     description: 'Each school: people, sign-ins, drop-offs, pickups, attendance days and messages in the period.',
     columns: [['school', 'School'], ['students', 'Students'], ['staff', 'Staff'], ['parents', 'Parents'], ['people_signed_in', 'People signed in'],
-      ['drop_offs', 'Drop-offs'], ['pick_ups', 'Pickups'], ['released_without_code', 'Released without code'], ['attendance_days', 'Days with attendance'], ['messages', 'Messages sent']],
+      ['drop_offs', 'Drop-offs'], ['pick_ups', 'Pickups'], ['declined', 'Requests declined'], ['attendance_days', 'Days with attendance'], ['messages', 'Messages sent']],
     sql: `
       SELECT s.name AS school,
         (SELECT COUNT(*) FROM students st WHERE st.school_id=s.id AND st.status='ACTIVE')::int AS students,
@@ -30,7 +30,7 @@ const REPORTS = {
         (SELECT COUNT(DISTINCT a.actor_user_id) FROM audit_logs a WHERE a.school_id=s.id AND a.action='SIGNED_IN' AND a.created_at >= $fromUtc AND a.created_at < $toUtc)::int AS people_signed_in,
         (SELECT COUNT(*) FROM queue_items q WHERE q.school_id=s.id AND q.status='APPROVED' AND q.request_type='DROP_OFF' AND q.approved_at >= $fromUtc AND q.approved_at < $toUtc)::int AS drop_offs,
         (SELECT COUNT(*) FROM queue_items q WHERE q.school_id=s.id AND q.status='APPROVED' AND q.request_type='PICK_UP' AND q.approved_at >= $fromUtc AND q.approved_at < $toUtc)::int AS pick_ups,
-        (SELECT COUNT(*) FROM queue_items q WHERE q.school_id=s.id AND q.verification_method='ADMIN_OVERRIDE' AND q.approved_at >= $fromUtc AND q.approved_at < $toUtc)::int AS released_without_code,
+        (SELECT COUNT(*) FROM queue_items q WHERE q.school_id=s.id AND q.status='DECLINED' AND q.declined_at >= $fromUtc AND q.declined_at < $toUtc)::int AS declined,
         (SELECT COUNT(DISTINCT ar.date) FROM attendance_records ar WHERE ar.school_id=s.id AND ar.date BETWEEN $fromDate AND $toDate)::int AS attendance_days,
         (SELECT COUNT(*) FROM notices n WHERE n.school_id=s.id AND n.created_at >= $fromUtc AND n.created_at < $toUtc)::int AS messages
       FROM schools s WHERE s.status <> 'ARCHIVED' AND ($school::text IS NULL OR s.id=$school)`,
@@ -38,13 +38,12 @@ const REPORTS = {
   },
   'drop-offs-pickups': {
     title: 'Drop-offs and pickups',
-    description: 'Per day and school: completed drop-offs and pickups, releases without the code, and the average wait.',
-    columns: [['date', 'Date'], ['school', 'School'], ['drop_offs', 'Drop-offs'], ['pick_ups', 'Pickups'], ['released_without_code', 'Released without code'], ['avg_wait_minutes', 'Average wait (min)']],
+    description: 'Per day and school: completed drop-offs and pickups, and the average wait.',
+    columns: [['date', 'Date'], ['school', 'School'], ['drop_offs', 'Drop-offs'], ['pick_ups', 'Pickups'], ['avg_wait_minutes', 'Average wait (min)']],
     sql: `
       SELECT ${localDay('q.approved_at')} AS date, s.name AS school,
         COUNT(*) FILTER (WHERE q.request_type='DROP_OFF')::int AS drop_offs,
         COUNT(*) FILTER (WHERE q.request_type='PICK_UP')::int AS pick_ups,
-        COUNT(*) FILTER (WHERE q.verification_method='ADMIN_OVERRIDE')::int AS released_without_code,
         ROUND(AVG(EXTRACT(EPOCH FROM (q.approved_at::timestamp - q.requested_at::timestamp)) / 60)::numeric, 1)::float AS avg_wait_minutes
       FROM queue_items q JOIN schools s ON s.id=q.school_id
       WHERE q.status='APPROVED' AND q.approved_at >= $fromUtc AND q.approved_at < $toUtc AND ($school::text IS NULL OR q.school_id=$school)
@@ -108,18 +107,17 @@ const REPORTS = {
   },
   exceptions: {
     title: 'Exceptions',
-    description: 'Per day and school: children released without the code, pickups cancelled for wrong codes, and wrong codes entered.',
-    columns: [['date', 'Date'], ['school', 'School'], ['released_without_code', 'Released without code'], ['wrong_code_lockouts', 'Cancelled (wrong codes)'], ['wrong_codes', 'Wrong codes entered']],
+    description: 'Per day and school: drop-off and pickup requests the school declined, and requests cancelled before they were answered.',
+    columns: [['date', 'Date'], ['school', 'School'], ['declined_drop_offs', 'Drop-offs declined'], ['declined_pick_ups', 'Pickups declined'], ['cancelled', 'Cancelled']],
     sql: `
-      SELECT date, school, SUM(overrides)::int AS released_without_code, SUM(lockouts)::int AS wrong_code_lockouts, SUM(wrong)::int AS wrong_codes FROM (
-        SELECT ${localDay('q.approved_at')} AS date, s.name AS school, 1 AS overrides, 0 AS lockouts, 0 AS wrong
-        FROM queue_items q JOIN schools s ON s.id=q.school_id
-        WHERE q.verification_method='ADMIN_OVERRIDE' AND q.approved_at >= $fromUtc AND q.approved_at < $toUtc AND ($school::text IS NULL OR q.school_id=$school)
-        UNION ALL
-        SELECT ${localDay('a.created_at')}, s.name, 0, CASE WHEN a.action='PICKUP_CODE_LOCKED_OUT' THEN 1 ELSE 0 END, CASE WHEN a.action='PICKUP_CODE_REJECTED' THEN 1 ELSE 0 END
-        FROM audit_logs a JOIN schools s ON s.id=a.school_id
-        WHERE a.action IN ('PICKUP_CODE_LOCKED_OUT','PICKUP_CODE_REJECTED') AND a.created_at >= $fromUtc AND a.created_at < $toUtc AND ($school::text IS NULL OR a.school_id=$school)
-      ) e GROUP BY date, school`,
+      SELECT ${localDay('COALESCE(q.declined_at, q.requested_at)')} AS date, s.name AS school,
+        COUNT(*) FILTER (WHERE q.status='DECLINED' AND q.request_type='DROP_OFF')::int AS declined_drop_offs,
+        COUNT(*) FILTER (WHERE q.status='DECLINED' AND q.request_type='PICK_UP')::int AS declined_pick_ups,
+        COUNT(*) FILTER (WHERE q.status='CANCELLED')::int AS cancelled
+      FROM queue_items q JOIN schools s ON s.id=q.school_id
+      WHERE q.status IN ('DECLINED','CANCELLED') AND COALESCE(q.declined_at, q.requested_at) >= $fromUtc AND COALESCE(q.declined_at, q.requested_at) < $toUtc
+        AND ($school::text IS NULL OR q.school_id=$school)
+      GROUP BY 1, s.id, s.name`,
     orderBy: 'date, school',
   },
 };

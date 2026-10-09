@@ -66,10 +66,9 @@ async function buildDashboard() {
       COUNT(*) FILTER (WHERE request_type='PICK_UP' AND status='APPROVED' AND approved_at >= $1 AND approved_at < $2)::int AS "pickUps",
       COUNT(*) FILTER (WHERE request_type='DROP_OFF' AND status='PENDING')::int AS "pendingDropOffs",
       COUNT(*) FILTER (WHERE request_type='PICK_UP' AND status='PENDING')::int AS "pendingPickUps",
-      COUNT(*) FILTER (WHERE verification_method='ADMIN_OVERRIDE' AND approved_at >= $1 AND approved_at < $2)::int AS "overrides"
-    FROM queue_items WHERE status='PENDING' OR approved_at >= $1`, [todayStart, todayEnd]);
+      COUNT(*) FILTER (WHERE status='DECLINED' AND declined_at >= $1 AND declined_at < $2)::int AS "declined"
+    FROM queue_items WHERE status='PENDING' OR approved_at >= $1 OR declined_at >= $1`, [todayStart, todayEnd]);
   const { rows: attendanceToday } = await pool.query(`SELECT status, COUNT(*)::int AS n FROM attendance_records WHERE date=$1 GROUP BY status`, [today]);
-  const { rows: [{ lockouts }] } = await pool.query(`SELECT COUNT(*)::int AS lockouts FROM audit_logs WHERE action='PICKUP_CODE_LOCKED_OUT' AND created_at >= $1 AND created_at < $2`, [todayStart, todayEnd]);
   const attendanceCount = status => attendanceToday.find(r => r.status === status)?.n ?? 0;
 
   // 30-day series, one row per local day.
@@ -110,8 +109,8 @@ async function buildDashboard() {
       ...ops,
       present: attendanceCount('PRESENT'),
       absent: attendanceCount('ABSENT') + attendanceCount('SICK'),
-      exceptions: ops.overrides + lockouts,
-      pickupLockouts: lockouts,
+      // Exceptions today: requests a teacher or administrator declined.
+      exceptions: ops.declined,
     },
     daily,
     generatedAt: new Date().toISOString(),
@@ -198,28 +197,7 @@ async function buildNeedsAttention() {
     });
   }
 
-  // Drop-off / pickup exceptions.
-  const { rows: pickupExceptions } = await pool.query(`
-    SELECT a.school_id AS id, s.name, COUNT(*) FILTER (WHERE a.action='PICKUP_CODE_LOCKED_OUT')::int AS lockouts
-    FROM audit_logs a JOIN schools s ON s.id=a.school_id
-    WHERE a.action='PICKUP_CODE_LOCKED_OUT' AND a.created_at >= $1 GROUP BY a.school_id, s.name ORDER BY lockouts DESC LIMIT 20`, [dayAgo]);
-  for (const school of pickupExceptions) {
-    items.push({
-      id: `pickup-lockout-${school.id}`, severity: 'high', category: 'Pickup exceptions',
-      title: `${school.name}: pickups cancelled for too many wrong codes`,
-      detail: `${school.lockouts} in the last 24 hours.`, link: `/platform/audit-logs?action=PICKUP_CODE_LOCKED_OUT&schoolId=${school.id}`,
-    });
-  }
-  const { rows: overrides } = await pool.query(`
-    SELECT qi.school_id AS id, s.name, COUNT(*)::int AS n FROM queue_items qi JOIN schools s ON s.id=qi.school_id
-    WHERE qi.verification_method='ADMIN_OVERRIDE' AND qi.approved_at >= $1 GROUP BY qi.school_id, s.name ORDER BY n DESC LIMIT 20`, [dayAgo]);
-  for (const school of overrides) {
-    items.push({
-      id: `override-${school.id}`, severity: 'medium', category: 'Pickup exceptions',
-      title: `${school.name}: children released without the pickup code`,
-      detail: `${school.n} administrator override(s) in the last 24 hours.`, link: `/platform/schools/${school.id}`,
-    });
-  }
+  // Drop-off / pickup: requests left waiting, and approvals left waiting.
   const { rows: waiting } = await pool.query(`
     SELECT qi.school_id AS id, s.name, COUNT(*)::int AS n FROM queue_items qi JOIN schools s ON s.id=qi.school_id AND s.status='ACTIVE'
     WHERE qi.status='PENDING' AND qi.requested_at < $1 GROUP BY qi.school_id, s.name ORDER BY n DESC LIMIT 20`, [halfHourAgo]);
@@ -349,7 +327,7 @@ export function registerPlatformInsights(router) {
     res.json({ items: rows, total, page: pageNumber, pageSize });
   }));
 
-  // Today's drop-off/pick-up activity and the latest requests (never pickup codes).
+  // Today's drop-off/pick-up activity and the latest requests.
   router.get('/schools/:id/operations', requirePlatformPermission('pickup:view'), asyncRoute(async (req, res) => {
     const school = await schoolOr404(req, res);
     if (!school) return;
@@ -360,11 +338,11 @@ export function registerPlatformInsights(router) {
         COUNT(*) FILTER (WHERE request_type='DROP_OFF' AND status='APPROVED' AND approved_at >= $2 AND approved_at < $3)::int AS "dropOffs",
         COUNT(*) FILTER (WHERE request_type='PICK_UP' AND status='APPROVED' AND approved_at >= $2 AND approved_at < $3)::int AS "pickUps",
         COUNT(*) FILTER (WHERE status='PENDING')::int AS pending,
-        COUNT(*) FILTER (WHERE verification_method='ADMIN_OVERRIDE' AND approved_at >= $2 AND approved_at < $3)::int AS overrides
-      FROM queue_items WHERE school_id=$1 AND (status='PENDING' OR approved_at >= $2)`, [school.id, todayStart, todayEnd]);
+        COUNT(*) FILTER (WHERE status='DECLINED' AND declined_at >= $2 AND declined_at < $3)::int AS declined
+      FROM queue_items WHERE school_id=$1 AND (status='PENDING' OR approved_at >= $2 OR declined_at >= $2)`, [school.id, todayStart, todayEnd]);
     const { rows: recent } = await pool.query(`
       SELECT qi.id, qi.request_type AS "requestType", qi.status, qi.requested_at AS "requestedAt", qi.approved_at AS "approvedAt",
-        qi.verification_method AS "verificationMethod", st.first_name || ' ' || st.last_name AS "studentName", c.name AS "campusName"
+        st.first_name || ' ' || st.last_name AS "studentName", c.name AS "campusName"
       FROM queue_items qi JOIN students st ON st.id=qi.student_id LEFT JOIN campuses c ON c.id=qi.campus_id
       WHERE qi.school_id=$1 ORDER BY qi.requested_at DESC LIMIT 25`, [school.id]);
     await auditView(req, school, 'PLATFORM_OPERATIONS_VIEWED', null);
@@ -400,7 +378,7 @@ export function registerPlatformInsights(router) {
       FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.school_id=$1 AND m.status='ACTIVE' AND m.role IN ('school_admin','staff')`, [school.id]);
     const { rows: events } = await pool.query(`
       SELECT action, COUNT(*)::int AS n FROM audit_logs
-      WHERE school_id=$1 AND created_at >= $2 AND action IN ('SIGN_IN_FAILED','SIGN_IN_LOCKED_OUT','MFA_CODE_FAILED','MFA_RESET','PASSWORD_RESET','PICKUP_CODE_LOCKED_OUT')
+      WHERE school_id=$1 AND created_at >= $2 AND action IN ('SIGN_IN_FAILED','SIGN_IN_LOCKED_OUT','MFA_CODE_FAILED','MFA_RESET','PASSWORD_RESET','PICKUP_PIN_LOCKED_OUT')
       GROUP BY action`, [school.id, weekAgo]);
     const { rows: supportSessions } = await pool.query(`
       SELECT ss.id, u.full_name AS "adminName", ss.reason, ss.allow_changes = 1 AS "allowChanges", ss.started_at AS "startedAt",

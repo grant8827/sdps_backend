@@ -801,6 +801,39 @@ const migrations = [
         CREATE INDEX IF NOT EXISTS schools_organization_idx ON schools(organization_id);                      -- district admins' schools, every request
       `);
     },
+  },  {
+    version: 31,
+    name: 'pickup codes removed',
+    async up(db) {
+      // The one-time pickup code is no longer used: a pickup is released
+      // by the teacher's or an administrator's confirmation alone. The
+      // columns stay (verification_method / override_reason describe how
+      // past pickups were released); any code still waiting on an open
+      // request is cleared so no unused secret is left behind.
+      await db.exec(`UPDATE queue_items SET pickup_code=NULL WHERE pickup_code IS NOT NULL;`);
+    },
+  },  {
+    version: 32,
+    name: 'pickup PIN: a private 6-digit PIN each parent enters to request a pickup',
+    async up(db) {
+      // Stored only as a salted scrypt hash (same as passwords), never
+      // readable. PIN_RESET links are the "Forgot PIN?" emails.
+      await db.exec(`
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS pickup_pin_hash TEXT;
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS pickup_pin_set_at TEXT;
+        ALTER TABLE account_links DROP CONSTRAINT IF EXISTS account_links_purpose_check;
+        ALTER TABLE account_links ADD CONSTRAINT account_links_purpose_check CHECK(purpose IN ('INVITE','RESET','PIN_RESET'));
+      `);
+    },
+  },
+  {
+    version: 33,
+    name: 'school logo, shown on every dashboard of that school',
+    async up(db) {
+      // Like the photo_url columns: an "s3://…" reference when S3 storage
+      // is set up (storage.js), otherwise the image itself as a data URL.
+      await db.exec(`ALTER TABLE schools ADD COLUMN IF NOT EXISTS logo_url TEXT;`);
+    },
   },
 ];
 
