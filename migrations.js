@@ -835,6 +835,24 @@ const migrations = [
       await db.exec(`ALTER TABLE schools ADD COLUMN IF NOT EXISTS logo_url TEXT;`);
     },
   },
+  {
+    version: 34,
+    name: 'email confirmation codes (school registration)',
+    async up(db) {
+      // One live code per address and purpose, stored as a salted hash
+      // (emailCodes.js). expires_at is epoch milliseconds.
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS email_codes (
+          email TEXT NOT NULL,
+          purpose TEXT NOT NULL,
+          code_hash TEXT NOT NULL,
+          expires_at BIGINT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (email, purpose)
+        );
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

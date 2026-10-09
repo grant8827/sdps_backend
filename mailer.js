@@ -65,7 +65,7 @@ export async function sendEmail({ to, subject, text, html }) {
 
 const BRAND = { navy: '#123B6D', blue: '#1976D2', slate: '#374151', bg: '#F4F8FC', muted: '#6B7280' };
 
-function layout({ preheader = '', heading, paragraphs = [], button, footnote, schoolName }) {
+function layout({ preheader = '', heading, paragraphs = [], code, button, footnote, schoolName }) {
   const html = `<!doctype html><html><body style="margin:0;padding:0;background:${BRAND.bg};">
 <span style="display:none;max-height:0;overflow:hidden;opacity:0;">${escapeHtml(preheader)}</span>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${BRAND.bg};padding:24px 12px;"><tr><td align="center">
@@ -74,6 +74,7 @@ function layout({ preheader = '', heading, paragraphs = [], button, footnote, sc
 <tr><td style="padding:28px;">
 <h1 style="margin:0 0 16px;font-size:22px;line-height:1.3;color:${BRAND.navy};">${escapeHtml(heading)}</h1>
 ${paragraphs.map(p => `<p style="margin:0 0 14px;font-size:16px;line-height:1.55;">${escapeHtml(p)}</p>`).join('\n')}
+${code ? `<p style="margin:22px 0;font-size:34px;font-weight:700;letter-spacing:8px;color:${BRAND.navy};background:${BRAND.bg};border-radius:10px;padding:16px;text-align:center;font-family:Menlo,Consolas,monospace;">${escapeHtml(code)}</p>` : ''}
 ${button ? `<p style="margin:24px 0;"><a href="${escapeHtml(button.url)}" style="display:inline-block;background:${BRAND.blue};color:#ffffff;text-decoration:none;font-weight:600;font-size:16px;padding:12px 22px;border-radius:8px;">${escapeHtml(button.label)}</a></p>
 <p style="margin:0 0 14px;font-size:13px;line-height:1.5;color:${BRAND.muted};">Or copy this link into your browser:<br><a href="${escapeHtml(button.url)}" style="color:${BRAND.blue};word-break:break-all;">${escapeHtml(button.url)}</a></p>` : ''}
 ${footnote ? `<p style="margin:18px 0 0;font-size:13px;line-height:1.5;color:${BRAND.muted};">${escapeHtml(footnote)}</p>` : ''}
@@ -83,6 +84,7 @@ Sent by SDPMPlus${schoolName ? ` on behalf of ${escapeHtml(schoolName)}` : ''} Â
 </td></tr></table></td></tr></table></body></html>`;
   const text = [
     heading, '', ...paragraphs.flatMap(p => [p, '']),
+    ...(code ? [`Your code: ${code}`, ''] : []),
     ...(button ? [`${button.label}: ${button.url}`, ''] : []),
     ...(footnote ? [footnote, ''] : []),
     `Sent by SDPMPlus${schoolName ? ` on behalf of ${schoolName}` : ''}. SDPMPlus is a service of GGHighTech LLC.`,
@@ -212,6 +214,21 @@ export function sendPinResetEmail({ to, fullName, link, retryOf }) {
     button: { label: 'Choose a new PIN', url: link },
     footnote: "This link works once and expires in 1 hour. If you didn't ask for it, ignore this email; your PIN stays the same.",
   }, log);
+}
+
+/**
+ * The 6-digit code that confirms an email address before a school is
+ * registered. The code is in the email only: the delivery log keeps
+ * neither it nor anything it could be worked out from.
+ */
+export function sendEmailCodeEmail({ to, code, minutes }) {
+  return deliver(to, 'Your SDPMPlus confirmation code', {
+    preheader: `Enter this code to confirm your email. It works for ${minutes} minutes.`,
+    heading: 'Confirm your email',
+    paragraphs: ['Enter this code in SDPMPlus to finish registering your school:'],
+    code,
+    footnote: `This code works once and expires in ${minutes} minutes. Nobody from SDPMPlus will ever ask you for it. If you didn't try to register a school, ignore this email.`,
+  }, { template: 'emailCode', args: {} });
 }
 
 /** Security notice after the pickup PIN is created, changed or reset. */

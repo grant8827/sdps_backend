@@ -32,6 +32,9 @@ process.env.NODE_ENV = 'test';
 // Most tests sign admins in with just a password; the two-step
 // verification tests at the end switch the requirement back on.
 process.env.REQUIRE_ADMIN_MFA = 'false';
+// Likewise the emailed confirmation code for registering a school; its
+// own test switches it on.
+process.env.REQUIRE_EMAIL_CONFIRMATION = 'false';
 const { app } = await import('../index.js');
 const server = app.listen(0);
 await new Promise((resolve, reject) => {
@@ -1727,5 +1730,84 @@ test('with S3 storage, images are uploaded privately, served by expiring links, 
   } finally {
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
     await new Promise(resolve => fakeS3.close(resolve));
+  }
+});
+
+test('registering a school needs the 6-digit code emailed to the administrator', async () => {
+  const { createEmailCode, checkEmailCode } = await import('../emailCodes.js');
+  const email = `Confirm-${randomUUID()}@Test.Local`;
+  const base = { schoolName: 'Confirmed School', campusName: 'Main', adminFullName: 'Careful Admin', email, password: 'password-1' };
+  const register = body => apiCall('POST', '/auth/register-school', null, body);
+  const sendCode = address => apiCall('POST', '/auth/register-school/send-code', null, { email: address });
+  const registered = async () => Boolean(await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email));
+
+  // Switched off (development): the apps are told to skip the step.
+  assert.deepEqual(await (await sendCode(email)).json(), { required: false });
+  assert.equal((await sendCode('not-an-email')).status, 400);
+
+  process.env.REQUIRE_EMAIL_CONFIRMATION = 'true';
+  try {
+    // No code, or a code nobody asked for: refused, nothing created.
+    for (const emailCode of [undefined, '', '123456', 123456]) {
+      const refused = await register({ ...base, emailCode });
+      assert.equal(refused.status, 400);
+      assert.equal((await refused.json()).code, 'EMAIL_CODE_MISSING');
+    }
+    assert.equal(await registered(), false);
+
+    // Email can't be sent in tests: the person is told, and no code is left behind.
+    const unsent = await sendCode(email);
+    assert.equal(unsent.status, 503);
+    assert.equal((await unsent.json()).code, 'EMAIL_NOT_SENT');
+    assert.equal((await db.prepare('SELECT COUNT(*)::int AS n FROM email_codes').get()).n, 0);
+    const logged = await db.prepare(`SELECT subject, args FROM notification_deliveries WHERE template='emailCode' ORDER BY created_at DESC LIMIT 1`).get();
+    assert.equal(logged.args, '{}', 'the delivery log never holds the code');
+    assert.doesNotMatch(logged.subject, /\d{6}/);
+    // An address that already has an account gets the same answer registering would give.
+    assert.match((await (await sendCode('admin@school.test')).json()).error, /already exists/);
+
+    // The code is stored hashed, and is tied to the address it was sent to.
+    const code = await createEmailCode(email);
+    assert.match(code, /^\d{6}$/);
+    const stored = await db.prepare('SELECT email, code_hash FROM email_codes').get();
+    assert.equal(stored.email, email.toLowerCase());
+    assert.ok(!stored.code_hash.includes(code));
+    const otherEmail = `other-${randomUUID()}@test.local`;
+    assert.equal((await (await register({ ...base, email: otherEmail, emailCode: code })).json()).code, 'EMAIL_CODE_MISSING', "someone else's code is no use");
+
+    // Wrong codes count down; a refused registration for another reason doesn't use the code up.
+    const wrong = code === '000000' ? '000001' : '000000';
+    const firstWrong = await (await register({ ...base, emailCode: wrong })).json();
+    assert.equal(firstWrong.code, 'EMAIL_CODE_WRONG');
+    assert.equal(firstWrong.triesLeft, 4);
+    assert.equal((await register({ ...base, password: 'short', emailCode: code })).status, 400);
+    assert.equal(await registered(), false);
+
+    // The right code registers the school, once.
+    const done = await register({ ...base, emailCode: ` ${code} ` });
+    assert.equal(done.status, 201);
+    assert.equal(await registered(), true);
+    assert.deepEqual(await checkEmailCode(email, code), { ok: false, reason: 'MISSING' });
+    await new Promise(resolve => setTimeout(resolve, 150)); // the audit entry is written just after the response
+    const audit = await db.prepare(`SELECT details FROM audit_logs WHERE action='SCHOOL_REGISTERED' ORDER BY seq DESC LIMIT 1`).get();
+    assert.doesNotMatch(JSON.stringify(audit), new RegExp(code));
+
+    // Five wrong tries throw the code away; an expired code is no good either.
+    const locked = `locked-${randomUUID()}@test.local`;
+    const lockedCode = await createEmailCode(locked);
+    const bad = lockedCode === '111111' ? '111112' : '111111';
+    for (let i = 0; i < 4; i++) assert.equal((await (await register({ ...base, email: locked, emailCode: bad })).json()).code, 'EMAIL_CODE_WRONG');
+    assert.equal((await (await register({ ...base, email: locked, emailCode: bad })).json()).code, 'EMAIL_CODE_LOCKED');
+    assert.equal((await (await register({ ...base, email: locked, emailCode: lockedCode })).json()).code, 'EMAIL_CODE_MISSING');
+    const expiredCode = await createEmailCode(locked);
+    await db.prepare('UPDATE email_codes SET expires_at=? WHERE email=?').run(Date.now() - 1000, locked);
+    assert.equal((await (await register({ ...base, email: locked, emailCode: expiredCode })).json()).code, 'EMAIL_CODE_MISSING');
+
+    // Asking for code after code is limited per address.
+    const greedy = `greedy-${randomUUID()}@test.local`;
+    for (let i = 0; i < 5; i++) assert.equal((await sendCode(greedy)).status, 503);
+    assert.equal((await sendCode(greedy)).status, 429);
+  } finally {
+    process.env.REQUIRE_EMAIL_CONFIRMATION = 'false';
   }
 });

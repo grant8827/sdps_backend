@@ -99,7 +99,7 @@ async function resend(delivery) {
   }
 }
 
-const TEMPLATE_NAMES = ['invite', 'addedToSchool', 'passwordReset', 'passwordChanged', 'pinReset', 'pinChanged', 'mfaReset', 'schoolWelcome', 'guardianDecision', 'guardianApproved', 'notice'];
+const TEMPLATE_NAMES = ['invite', 'addedToSchool', 'passwordReset', 'passwordChanged', 'pinReset', 'pinChanged', 'emailCode', 'mfaReset', 'schoolWelcome', 'guardianDecision', 'guardianApproved', 'notice'];
 
 export function registerPlatformNotifications(router) {
   router.get('/notifications/summary', requirePlatformPermission('platform:view'), asyncRoute(async (req, res) => {

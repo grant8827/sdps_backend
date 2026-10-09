@@ -14,10 +14,11 @@ import { asyncRoute } from './asyncRoute.js';
 import { audited, writeAudit } from './audit.js';
 import { LegalHoldError, MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
 import { MAX_LOGO_DATA_URL_LENGTH, imageHosts, parseImageDataUrl, removeStoredImage, signImageUrls, storageEnabled, storeImage } from './storage.js';
+import { CODE_MINUTES, checkEmailCode, createEmailCode, discardEmailCode, emailConfirmationRequired, sweepEmailCodes } from './emailCodes.js';
 import { ADMIN_RESET_TTL_MS, claimPinLink, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
 import { checkPin, hasPin, pinProblem, setPin } from './pickupPin.js';
 import {
-  deliverLater, sendAddedToSchoolEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail, sendMfaResetEmail,
+  deliverLater, sendAddedToSchoolEmail, sendEmailCodeEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail, sendMfaResetEmail,
   sendPasswordChangedEmail, sendPasswordResetEmail, sendPinChangedEmail, sendPinResetEmail, sendSchoolWelcomeEmail, verifyEmailConnection,
 } from './mailer.js';
 import { randomUUID } from 'node:crypto';
@@ -651,6 +652,32 @@ app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req
 
 const codeFromSchoolName = name => name.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'SCHOOL';
 
+// Step 1 of registering a school: prove the email address is yours.
+// Emails a 6-digit code (emailCodes.js) that register-school below then
+// requires. Answers { required: false } when the check is switched off
+// (REQUIRE_EMAIL_CONFIRMATION=false, development only), so the apps
+// know to skip the code step.
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+app.post('/api/auth/register-school/send-code', asyncRoute(async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+  if (!EMAIL_SHAPE.test(email) || email.length > 254) return res.status(400).json({ error: 'Enter a valid email address.' });
+  if (!emailConfirmationRequired()) return res.json({ required: false });
+  if ((await hitLimit(`emailcode:ip:${req.ip}`, RESET_WINDOW_MS)) > 20 || (await hitLimit(`emailcode:${email.toLowerCase()}`, RESET_WINDOW_MS)) > 5) {
+    return res.status(429).json({ error: 'Too many codes have been requested. Check your email, or try again in an hour.' });
+  }
+  // Same answer register-school gives, so nothing new is revealed here.
+  if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email)) {
+    return res.status(400).json({ error: 'An account with this email already exists.' });
+  }
+  const code = await createEmailCode(email);
+  const { sent } = await sendEmailCodeEmail({ to: email, code, minutes: CODE_MINUTES });
+  if (!sent) {
+    await discardEmailCode(email);
+    return res.status(503).json({ error: "We couldn't send the confirmation email right now. Please try again in a few minutes.", code: 'EMAIL_NOT_SENT' });
+  }
+  res.json({ required: true, message: `We emailed a 6-digit code to ${email}. It works for ${CODE_MINUTES} minutes.` });
+}));
+
 // Public self-service signup: a brand-new school registers its first
 // campus and admin account in one step, then signs straight in (same
 // response shape as /api/auth/login) so they land in the admin
@@ -667,6 +694,17 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
   if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
   // The school's logo is optional, and can be added or changed later in School Setup.
   try { parseImageDataUrl(logoDataUrl, LOGO_RULES); } catch (error) { return res.status(400).json({ error: error.message }); }
+  // The emailed code proves the administrator's address is theirs. It is
+  // checked here and only used up once the school has been created.
+  if (emailConfirmationRequired()) {
+    const check = await checkEmailCode(email, typeof req.body.emailCode === 'string' ? req.body.emailCode.trim() : '');
+    if (!check.ok) {
+      const error = check.reason === 'WRONG' ? `That code is not right. ${check.triesLeft} ${check.triesLeft === 1 ? 'try' : 'tries'} left.`
+        : check.reason === 'LOCKED' ? 'Too many wrong codes. Ask for a new code.'
+        : 'Confirm your email first: ask for a code, then enter it here. Codes expire after 10 minutes.';
+      return res.status(400).json({ error, code: `EMAIL_CODE_${check.reason}`, triesLeft: check.triesLeft });
+    }
+  }
   // Checked before the logo is uploaded so a sign-up that is going to
   // be refused doesn't leave a file behind (checked again inside).
   if (await db.prepare('SELECT 1 FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim())) {
@@ -713,6 +751,7 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
       // the new admin sets up their authenticator before landing in the dashboard.
       return { schoolId, userId, code, session: await login(email.trim(), password) };
     });
+    await discardEmailCode(email);
     deliverLater(() => sendSchoolWelcomeEmail({ to: email.trim(), fullName: adminFullName.trim(), schoolName: schoolName.trim(), schoolCode: result.code }));
     res.locals.audit = {
       schoolId: result.schoolId, actor: { id: result.userId, full_name: adminFullName.trim() }, actorRole: 'school_admin',
@@ -2465,6 +2504,7 @@ if (process.env.NODE_ENV !== 'test') {
   // Background jobs (report exports): see jobs.js.
   startJobWorker();
   startRateLimitSweeper();
+  setInterval(() => sweepEmailCodes().catch(error => console.error('Email code sweep failed', error)), 60 * 60 * 1000).unref();
 
   // Deploys stop the old server with SIGTERM: stop taking new requests,
   // let the ones in flight finish (up to 10 s), then close the database.

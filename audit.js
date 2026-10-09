@@ -13,7 +13,8 @@ import { pool, id } from './db.js';
 // Request-body keys never copied into an entry's details — secrets
 // (including pickup PINs: pin, currentPin, newPin), and photos (a base64
 // data URL can be megabytes).
-const OMITTED_KEYS = /password|token|secret|photo|(^|[a-z])pin$/i;
+// Also the emailed confirmation code (emailCode) and any uploaded image.
+const OMITTED_KEYS = /password|token|secret|photo|dataurl|emailcode|(^|[a-z])pin$/i;
 const MAX_STRING = 200;
 
 export function sanitizeDetails(value, depth = 0) {
