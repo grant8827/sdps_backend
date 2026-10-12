@@ -853,6 +853,86 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 35,
+    name: 'student-based subscriptions: plan limits and prices, trials, enrollment history, change requests',
+    async up(db) {
+      // A plan now has a student limit (NULL = no limit) and a monthly and
+      // an annual price (NULL with custom_pricing = agreed case by case).
+      // The older price_cents / billing_interval / pricing_model columns
+      // stay for plans created before this.
+      // A subscription remembers the price agreed (price_cents), so a
+      // later change to the plan's price doesn't change what they pay.
+      await db.exec(`
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS student_limit INTEGER CHECK(student_limit IS NULL OR student_limit > 0);
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS monthly_price_cents INTEGER CHECK(monthly_price_cents IS NULL OR monthly_price_cents >= 0);
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS annual_price_cents INTEGER CHECK(annual_price_cents IS NULL OR annual_price_cents >= 0);
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS custom_pricing INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 100;
+
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS billing_interval TEXT CHECK(billing_interval IN ('MONTH','YEAR'));
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS price_cents INTEGER CHECK(price_cents IS NULL OR price_cents >= 0);
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS trial_ends_on TEXT;
+        ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS cancel_at_period_end INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE IF NOT EXISTS plan_price_history (
+          id BIGSERIAL PRIMARY KEY,
+          plan_id TEXT NOT NULL REFERENCES plans(id),
+          student_limit INTEGER,
+          monthly_price_cents INTEGER,
+          annual_price_cents INTEGER,
+          custom_pricing INTEGER NOT NULL DEFAULT 0,
+          changed_by_user_id TEXT,
+          changed_by_name TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS plan_price_history_plan_idx ON plan_price_history(plan_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS enrollment_history (
+          id BIGSERIAL PRIMARY KEY,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          active_students INTEGER NOT NULL,
+          reason TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS enrollment_history_school_idx ON enrollment_history(school_id, id DESC);
+
+        CREATE TABLE IF NOT EXISTS platform_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+        CREATE TABLE IF NOT EXISTS subscription_requests (
+          id TEXT PRIMARY KEY,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          type TEXT NOT NULL CHECK(type IN ('CHANGE_PLAN','CANCEL')),
+          plan_id TEXT REFERENCES plans(id),
+          billing_interval TEXT CHECK(billing_interval IN ('MONTH','YEAR')),
+          note TEXT,
+          status TEXT NOT NULL DEFAULT 'OPEN' CHECK(status IN ('OPEN','APPROVED','DECLINED','WITHDRAWN')),
+          requested_by_user_id TEXT,
+          requested_by_name TEXT,
+          resolved_by_name TEXT,
+          resolution_note TEXT,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS'),
+          resolved_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS subscription_requests_one_open ON subscription_requests(school_id) WHERE status='OPEN';
+      `);
+      // The four standard plans (USD; annual = ten months, two free).
+      // Skipped for any name that already exists.
+      const standard = [
+        ['plan-starter', 'Starter', 'Up to 150 students', 150, 4900, 49000, 0, 10],
+        ['plan-growth', 'Growth', 'Up to 500 students', 500, 9900, 99000, 0, 20],
+        ['plan-professional', 'Professional', 'Up to 1,000 students', 1000, 19900, 199000, 0, 30],
+        ['plan-enterprise', 'Enterprise', '1,001 or more students. Pricing agreed with each school.', null, null, null, 1, 40],
+      ];
+      for (const [planId, name, description, limit, monthly, annual, custom, sort] of standard) {
+        await db.prepare(`
+          INSERT INTO plans (id,name,description,pricing_model,price_cents,currency,billing_interval,student_limit,monthly_price_cents,annual_price_cents,custom_pricing,sort_order)
+          SELECT ?,?,?,'FLAT',?,'USD','MONTH',?,?,?,?,?
+          WHERE NOT EXISTS (SELECT 1 FROM plans WHERE LOWER(name)=LOWER(?) OR id=?)`)
+          .run(planId, name, description, monthly ?? 0, limit, monthly, annual, custom, sort, name, planId);
+      }
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

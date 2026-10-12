@@ -15,6 +15,8 @@ import { audited, writeAudit } from './audit.js';
 import { LegalHoldError, MIN_RETENTION_DAYS, applyRetention, applyRetentionEverywhere, buildSchoolExport, buildStudentExport, deletedStudentLabel, permanentlyDeleteStudent, previewRetention, retentionSettings } from './dataRights.js';
 import { MAX_LOGO_DATA_URL_LENGTH, imageHosts, parseImageDataUrl, removeStoredImage, signImageUrls, storageEnabled, storeImage } from './storage.js';
 import { CODE_MINUTES, checkEmailCode, createEmailCode, discardEmailCode, emailConfirmationRequired, sweepEmailCodes } from './emailCodes.js';
+import { StudentLimitError, assertRoomForStudent, recordEnrollment, startTrial, studentLimitResponse } from './subscriptions.js';
+import { registerSchoolBilling, startBillingSweeper } from './schoolBilling.js';
 import { ADMIN_RESET_TTL_MS, claimPinLink, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
 import { checkPin, hasPin, pinProblem, setPin } from './pickupPin.js';
 import {
@@ -746,6 +748,9 @@ app.post('/api/auth/register-school', audited('SCHOOL_REGISTERED'), asyncRoute(a
       await db.prepare(`INSERT INTO school_years (id,school_id,name,starts_on,ends_on,status) VALUES (?,?,?,?,?,'ACTIVE')`)
         .run(id('year'), schoolId, `${startYear}-${startYear + 1}`, `${startYear}-08-01`, `${startYear + 1}-06-30`);
 
+      // Every new school starts on a free trial with every feature (subscriptions.js).
+      await startTrial(schoolId);
+
       // Admins must use two-step verification, so this is normally a
       // { mfaSetupRequired, mfaToken } challenge rather than a session —
       // the new admin sets up their authenticator before landing in the dashboard.
@@ -1243,6 +1248,9 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'),
   res.status(204).end();
 }));
 
+// The school's own Subscription page (schoolBilling.js).
+registerSchoolBilling(app);
+
 // The school's name and logo, shown at the top of every signed-in
 // person's dashboard (parents, teachers, front desk, administrators).
 app.get('/api/me/school', requireAuth, requireSchoolAccess(), asyncRoute(async (req, res) => {
@@ -1697,6 +1705,8 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
         const permittedGuardian = await db.prepare(`SELECT 1 FROM guardians gu JOIN memberships m ON m.user_id=gu.user_id WHERE gu.id=? AND m.school_id=? AND m.status='ACTIVE'`).get(guardianId, req.school.id);
         if (!permittedGuardian) throw new Error('The selected parent does not belong to this school');
       }
+      // The plan's student limit: refused here if the school is full (subscriptions.js).
+      await assertRoomForStudent(req.school.id, `${firstName.trim()} ${lastName.trim()}`);
       const studentId = id('student');
       await db.prepare(`INSERT INTO students (id,first_name,last_name,date_of_birth,student_number,photo_url,daycare,school_id,campus_id) VALUES (?,?,?,?,?,?,?,?,?)`).run(studentId, firstName.trim(), lastName.trim(), dateOfBirth || null, studentNumber?.trim() || null, photoUrl, daycare ? 1 : 0, req.school.id, selectedClass.campus_id);
       await db.prepare(`INSERT INTO student_enrollments (id,student_id,school_year_id,grade_level_id,class_id,school_id,campus_id) VALUES (?,?,?,?,?,?,?)`).run(id('enrollment'), studentId, schoolYearId, gradeLevelId, classId, req.school.id, selectedClass.campus_id);
@@ -1704,6 +1714,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
       return studentId;
     });
     photoUrl = null; // saved with the student: nothing to clean up if the invite fails
+    await recordEnrollment(req.school.id, 'Student added');
     let invite = {};
     if (createdGuardianAccount) {
       invite = await inviteNewAccount({ userId: createdGuardianAccount, to: guardian.email.trim(), fullName: guardian.fullName.trim(), schoolName: req.school.name, roleLabel: 'a parent or guardian' });
@@ -1714,6 +1725,7 @@ app.post('/api/admin/students', requireAuth, requireSchoolAccess('school_admin')
     res.status(201).json({ id: studentId, ...invite });
   } catch (error) {
     await removeStoredImage(photoUrl);
+    if (error instanceof StudentLimitError) return res.status(409).json(studentLimitResponse(error));
     res.status(400).json({ error: isUniqueViolation(error) ? 'Student number or guardian email already exists' : error.message });
   }
 }));
@@ -1733,14 +1745,28 @@ app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolA
 // student_guardians links (both declared ON DELETE CASCADE).
 app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_STATUS_CHANGED', req => ({ targetType: 'student', targetId: req.params.id, details: { status: req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE' } })), asyncRoute(async (req, res) => {
   const status = req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
-  const result = await db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
+  let result;
+  try {
+    result = await withTransaction(async () => {
+      // Reactivating a suspended student takes a place on the plan again.
+      const student = await db.prepare(`SELECT first_name || ' ' || last_name AS name, status FROM students WHERE id=? AND school_id=? AND status<>'ARCHIVED' FOR UPDATE`).get(req.params.id, req.school.id);
+      if (!student) return { changes: 0 };
+      if (status === 'ACTIVE' && student.status !== 'ACTIVE') await assertRoomForStudent(req.school.id, student.name);
+      return db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
+    });
+  } catch (error) {
+    if (error instanceof StudentLimitError) return res.status(409).json(studentLimitResponse(error));
+    throw error;
+  }
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
+  await recordEnrollment(req.school.id, status === 'ACTIVE' ? 'Student reactivated' : 'Student suspended');
   res.status(204).end();
 }));
 
 app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_REMOVED', req => ({ targetType: 'student', targetId: req.params.id })), asyncRoute(async (req, res) => {
   const result = await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at=${NOW_UTC} WHERE id=? AND school_id=? AND status<>'ARCHIVED'`).run(req.params.id, req.school.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
+  await recordEnrollment(req.school.id, 'Student removed');
   res.status(204).end();
 }));
 
@@ -2393,8 +2419,20 @@ app.get('/api/admin/students/removed', requireAuth, requireSchoolAccess('school_
 }));
 
 app.post('/api/admin/students/:id/restore', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_RESTORED', req => ({ targetType: 'student', targetId: req.params.id, details: null })), asyncRoute(async (req, res) => {
-  const result = await db.prepare(`UPDATE students SET status='ACTIVE', archived_at=NULL WHERE id=? AND school_id=? AND status='ARCHIVED'`).run(req.params.id, req.school.id);
+  let result;
+  try {
+    result = await withTransaction(async () => {
+      const student = await db.prepare(`SELECT first_name || ' ' || last_name AS name FROM students WHERE id=? AND school_id=? AND status='ARCHIVED' FOR UPDATE`).get(req.params.id, req.school.id);
+      if (!student) return { changes: 0 };
+      await assertRoomForStudent(req.school.id, student.name); // a restored student takes a place on the plan
+      return db.prepare(`UPDATE students SET status='ACTIVE', archived_at=NULL WHERE id=? AND school_id=? AND status='ARCHIVED'`).run(req.params.id, req.school.id);
+    });
+  } catch (error) {
+    if (error instanceof StudentLimitError) return res.status(409).json(studentLimitResponse(error));
+    throw error;
+  }
   if (result.changes === 0) return res.status(404).json({ error: 'Removed student not found' });
+  await recordEnrollment(req.school.id, 'Student restored');
   res.status(204).end();
 }));
 
@@ -2504,6 +2542,7 @@ if (process.env.NODE_ENV !== 'test') {
   // Background jobs (report exports): see jobs.js.
   startJobWorker();
   startRateLimitSweeper();
+  startBillingSweeper();
   setInterval(() => sweepEmailCodes().catch(error => console.error('Email code sweep failed', error)), 60 * 60 * 1000).unref();
 
   // Deploys stop the old server with SIGTERM: stop taking new requests,

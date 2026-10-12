@@ -1491,14 +1491,13 @@ test('billing: a plan prices an invoice, payments mark it paid, and an overdue i
   const platformAdmin = await login('platform-2@test.local', 'password');
   assert.equal((await apiCall('GET', '/superadmin/billing/plans', platformAdmin.token)).status, 403, 'platform admins have no billing access');
 
-  const plan = await apiCall('POST', '/superadmin/billing/plans', billing.token, { name: 'Per student yearly', pricingModel: 'PER_STUDENT', priceCents: 500, interval: 'YEAR' });
+  const plan = await apiCall('POST', '/superadmin/billing/plans', billing.token, { name: 'Pilot yearly', studentLimit: null, monthlyPriceCents: 5000, annualPriceCents: 50000 });
   assert.equal(plan.status, 201);
   const { id: planId } = await plan.json();
-  assert.equal((await apiCall('PUT', '/superadmin/billing/schools/school-default/subscription', billing.token, { planId, status: 'ACTIVE', startedOn: '2026-08-01', currentPeriodEnd: '2027-07-31' })).status, 204);
-  const { n: students } = await db.prepare(`SELECT COUNT(*)::int AS n FROM students WHERE school_id='school-default' AND status='ACTIVE'`).get();
+  assert.equal((await apiCall('PUT', '/superadmin/billing/schools/school-default/subscription', billing.token, { planId, status: 'ACTIVE', interval: 'YEAR', startedOn: '2026-08-01', currentPeriodEnd: '2027-07-31' })).status, 204);
 
   const created = await (await apiCall('POST', '/superadmin/billing/invoices', billing.token, { schoolId: 'school-default', periodStart: '2026-08-01', periodEnd: '2027-07-31', dueOn: '2099-01-01' })).json();
-  assert.equal(created.amountCents, 500 * students);
+  assert.equal(created.amountCents, 50000, 'the annual price the school agreed');
   assert.match(created.number, /^INV-\d{4}-\d+$/);
   const pay = body => apiCall('POST', `/superadmin/billing/invoices/${created.id}/payments`, billing.token, body);
   assert.equal((await pay({ amountCents: 100, method: 'CHECK' })).status, 409, 'issue it first');
@@ -1521,7 +1520,7 @@ test('billing: a plan prices an invoice, payments mark it paid, and an overdue i
   assert.ok(overdue.items.some(i => i.id === late.id && i.overdue));
   assert.equal((await apiCall('POST', `/superadmin/billing/invoices/${late.id}/void`, billing.token, { reason: 'Waived for pilot' })).status, 204);
   const schoolBilling = await (await apiCall('GET', '/superadmin/billing/schools/school-default', billing.token)).json();
-  assert.equal(schoolBilling.subscription.planName, 'Per student yearly');
+  assert.equal(schoolBilling.subscription.planName, 'Pilot yearly');
   assert.ok(await waitForAudit(`action='PAYMENT_RECORDED'`, []));
   assert.ok(await waitForAudit(`action='SUBSCRIPTION_CHANGED' AND school_id='school-default'`, []));
 });
@@ -1810,4 +1809,268 @@ test('registering a school needs the 6-digit code emailed to the administrator',
   } finally {
     process.env.REQUIRE_EMAIL_CONFIRMATION = 'false';
   }
+});
+
+// ---- Student-based subscriptions --------------------------------------------------------------
+
+// School B on its own year and class, so students can be added through the API.
+async function subscriptionSchool() {
+  await db.prepare(`INSERT INTO school_years (id,school_id,name,starts_on,ends_on,status) VALUES ('year-b','school-b','2026-2027','2026-08-01','2027-06-30','ACTIVE') ON CONFLICT (id) DO NOTHING`).run();
+  await db.prepare(`INSERT INTO classes (id,name,school_year_id,grade_level_id,school_id,campus_id) VALUES ('class-b','Room B','year-b','grade-1','school-b','campus-b') ON CONFLICT (id) DO NOTHING`).run();
+  const admin = await login('admin-b@test.local', 'password');
+  const billing = await login('billing-1@test.local', 'password');
+  const active = async () => (await db.prepare(`SELECT COUNT(*)::int AS n FROM students WHERE school_id='school-b' AND status='ACTIVE'`).get()).n;
+  // Brings the school to exactly `target` active students, straight in the database.
+  const fillTo = async target => {
+    const missing = target - await active();
+    if (missing > 0) {
+      await db.prepare(`INSERT INTO students (id,first_name,last_name,school_id,campus_id) SELECT 'bulk-' || gen_random_uuid(), 'Bulk', 'Student ' || g, 'school-b', 'campus-b' FROM generate_series(1, ?::int) g`).run(missing);
+    }
+    assert.equal(await active(), target);
+  };
+  let counter = 0;
+  const add = (firstName = `Kid${++counter}`) => apiCall('POST', '/admin/students', admin.token, { firstName, lastName: 'Boundary', schoolYearId: 'year-b', gradeLevelId: 'grade-1', classId: 'class-b' });
+  const setPlan = (planId, extra = {}) => apiCall('PUT', '/superadmin/billing/schools/school-b/subscription', billing.token, { planId, status: 'ACTIVE', interval: 'MONTH', ...extra });
+  return { admin, billing, active, fillTo, add, setPlan };
+}
+
+test('subscriptions: the four standard plans exist, and a new school starts a 30-day trial with no card', async () => {
+  const billing = await login('billing-1@test.local', 'password');
+  const plans = await (await apiCall('GET', '/superadmin/billing/plans', billing.token)).json();
+  const byId = Object.fromEntries(plans.map(plan => [plan.id, plan]));
+  assert.deepEqual(['plan-starter', 'plan-growth', 'plan-professional'].map(planId => [byId[planId].studentLimit, byId[planId].monthlyPriceCents, byId[planId].annualPriceCents]),
+    [[150, 4900, 49000], [500, 9900, 99000], [1000, 19900, 199000]]);
+  for (const planId of ['plan-starter', 'plan-growth', 'plan-professional']) assert.equal(byId[planId].annualPriceCents, byId[planId].monthlyPriceCents * 10, 'annual is two months free');
+  assert.equal(byId['plan-enterprise'].customPricing, true);
+  assert.equal(byId['plan-enterprise'].studentLimit, null);
+
+  const email = `trial-${randomUUID()}@test.local`;
+  assert.equal((await apiCall('POST', '/auth/register-school', null, { schoolName: 'Trial Academy', campusName: 'Main', adminFullName: 'Trial Admin', email, password: 'password-1' })).status, 201);
+  const admin = await login(email, 'password-1');
+  const mine = await (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  assert.equal(mine.subscription.status, 'TRIALING');
+  assert.equal(mine.subscription.planId, 'plan-professional');
+  assert.equal(mine.subscription.trialDaysLeft, 30);
+  assert.equal(mine.subscription.trialEnded, false);
+  assert.equal(mine.activeStudents, 0);
+  assert.equal(mine.studentLimit, 1000);
+  assert.equal(mine.level, 'OK');
+  assert.equal(mine.plans.length >= 4, true);
+  assert.ok(mine.plans.every(plan => !('features' in plan)), 'plans carry a limit and prices, never a feature list');
+
+  // The platform can put a trial on any plan, for any length.
+  const schoolId = (await db.prepare('SELECT school_id FROM memberships m JOIN users u ON u.id=m.user_id WHERE u.email=?').get(email)).school_id;
+  assert.equal((await apiCall('PUT', `/superadmin/billing/schools/${schoolId}/subscription`, billing.token, { planId: 'plan-starter', status: 'TRIALING', trialDays: 45 })).status, 204);
+  const moved = await (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  assert.deepEqual([moved.subscription.planId, moved.subscription.status, moved.subscription.trialDaysLeft, moved.studentLimit], ['plan-starter', 'TRIALING', 45, 150]);
+  assert.equal((await apiCall('PUT', `/superadmin/billing/schools/${schoolId}/subscription`, billing.token, { planId: 'plan-enterprise', status: 'TRIALING', trialEndsOn: '2099-01-01' })).status, 204, 'a trial on Enterprise needs no price yet');
+  assert.equal((await apiCall('PUT', `/superadmin/billing/schools/${schoolId}/subscription`, billing.token, { planId: 'plan-starter', status: 'TRIALING', trialDays: 0 })).status, 400);
+
+  // Trial length and plan are platform settings.
+  const settings = await (await apiCall('GET', '/superadmin/billing/settings', billing.token)).json();
+  assert.deepEqual([settings.trialDays, settings.graceDays, settings.trialPlanId], [30, 14, 'plan-professional']);
+  assert.equal((await apiCall('PUT', '/superadmin/billing/settings', billing.token, { trialDays: 0 })).status, 400);
+  assert.equal((await apiCall('PUT', '/superadmin/billing/settings', billing.token, { trialPlanId: 'no-such-plan' })).status, 400);
+  assert.equal((await apiCall('PUT', '/superadmin/billing/settings', billing.token, { trialDays: 14, graceDays: 7, trialPlanId: 'plan-growth' })).status, 204);
+  const second = `trial-${randomUUID()}@test.local`;
+  await apiCall('POST', '/auth/register-school', null, { schoolName: 'Second Trial', campusName: 'Main', adminFullName: 'Second Admin', email: second, password: 'password-1' });
+  const secondView = await (await apiCall('GET', '/admin/subscription', (await login(second, 'password-1')).token)).json();
+  assert.deepEqual([secondView.subscription.planId, secondView.subscription.trialDaysLeft, secondView.graceDays], ['plan-growth', 14, 7]);
+  assert.equal((await apiCall('PUT', '/superadmin/billing/settings', billing.token, { trialDays: 30, graceDays: 14, trialPlanId: 'plan-professional' })).status, 204);
+  assert.ok(await waitForAudit(`action='BILLING_SETTINGS_CHANGED'`, []));
+});
+
+test('subscriptions: the student limit is a hard cap at 150/151, 500/501 and 1,000/1,001, and never removes anyone', async () => {
+  const { admin, active, fillTo, add, setPlan } = await subscriptionSchool();
+  const view = async () => (await apiCall('GET', '/admin/subscription', admin.token)).json();
+
+  for (const [planId, limit, name] of [['plan-starter', 150, 'Starter'], ['plan-growth', 500, 'Growth'], ['plan-professional', 1000, 'Professional']]) {
+    assert.equal((await setPlan(planId)).status, 204);
+    await fillTo(limit - 1);
+    assert.equal((await view()).level, 'CLOSE');
+    assert.equal((await add()).status, 201, `student ${limit} fits on ${name}`);
+    const full = await view();
+    assert.deepEqual([full.activeStudents, full.studentLimit, full.remaining, full.percentUsed, full.level], [limit, limit, 0, 100, 'FULL']);
+
+    const refused = await add('Extra');
+    assert.equal(refused.status, 409, `student ${limit + 1} does not fit on ${name}`);
+    const body = await refused.json();
+    assert.equal(body.code, 'STUDENT_LIMIT_REACHED');
+    assert.match(body.error, new RegExp(`${name} plan covers up to ${limit.toLocaleString('en-US')} active students`));
+    assert.match(body.error, /Extra Boundary was not added\. You don't have to upgrade/);
+    assert.equal(await active(), limit, 'nobody was added, nobody was removed');
+    assert.equal(await db.prepare(`SELECT 1 FROM students WHERE school_id='school-b' AND first_name='Extra'`).get(), undefined);
+  }
+
+  // The next plan up is recommended; a plan that is too small can't be chosen.
+  const atThousand = await view();
+  assert.equal(atThousand.plans.find(plan => plan.recommended).id, 'plan-enterprise');
+  assert.deepEqual(atThousand.plans.filter(plan => plan.tooSmall).map(plan => plan.id), ['plan-starter', 'plan-growth']);
+  assert.equal((await setPlan('plan-starter')).status, 409, 'the platform cannot put a 1,000-student school on a 150-student plan');
+
+  // Enterprise has no limit: student 1,001 is added.
+  assert.equal((await setPlan('plan-enterprise')).status, 400, 'custom pricing needs an agreed price');
+  assert.equal((await setPlan('plan-enterprise', { priceCents: 45000, reason: 'Enterprise contract 2026-04' })).status, 204);
+  assert.equal((await add()).status, 201);
+  assert.equal(await active(), 1001);
+  assert.deepEqual([(await view()).studentLimit, (await view()).level], [null, 'OK']);
+
+  // Only ACTIVE students count: suspending or removing one frees a place,
+  // and bringing one back needs a free place.
+  await db.prepare(`DELETE FROM student_enrollments WHERE student_id IN (SELECT id FROM students WHERE school_id='school-b' AND first_name='Bulk')`).run();
+  await db.prepare(`DELETE FROM students WHERE school_id='school-b' AND first_name='Bulk'`).run();
+  const kept = await db.prepare(`SELECT id FROM students WHERE school_id='school-b' AND status='ACTIVE' ORDER BY id LIMIT 2`).all();
+  assert.equal((await setPlan('plan-starter')).status, 204);
+  await fillTo(150);
+  assert.equal((await apiCall('PATCH', `/admin/students/${kept[0].id}`, admin.token, { status: 'SUSPENDED' })).status, 204);
+  assert.equal((await apiCall('DELETE', `/admin/students/${kept[1].id}`, admin.token)).status, 204);
+  assert.equal(await active(), 148);
+  assert.equal((await add()).status, 201);
+  assert.equal((await add()).status, 201);
+  assert.equal(await active(), 150);
+  const reactivate = await apiCall('PATCH', `/admin/students/${kept[0].id}`, admin.token, { status: 'ACTIVE' });
+  assert.equal(reactivate.status, 409);
+  assert.equal((await reactivate.json()).code, 'STUDENT_LIMIT_REACHED');
+  assert.equal((await (await apiCall('POST', `/admin/students/${kept[1].id}/restore`, admin.token)).json()).code, 'STUDENT_LIMIT_REACHED');
+  assert.equal((await apiCall('PATCH', `/admin/students/${kept[0].id}`, admin.token, { status: 'SUSPENDED' })).status, 204, 'suspending is always allowed');
+  assert.equal(await active(), 150);
+
+  // Two people adding the last place at the same moment: exactly one gets it.
+  const one = await db.prepare(`SELECT id FROM students WHERE school_id='school-b' AND status='ACTIVE' AND first_name='Bulk' LIMIT 1`).get();
+  await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at='2026-01-01 00:00:00' WHERE id=?`).run(one.id);
+  const race = await Promise.all([add('RaceA'), add('RaceB'), add('RaceC')]);
+  assert.deepEqual(race.map(r => r.status).sort(), [201, 409, 409]);
+  assert.equal(await active(), 150);
+
+  // The history of enrollment changes is kept.
+  const history = (await view()).enrollmentHistory;
+  assert.ok(history.length >= 4);
+  assert.equal(history[0].activeStudents, 150);
+  assert.ok(history.some(entry => entry.reason === 'Student suspended') && history.some(entry => entry.reason === 'Student removed'));
+});
+
+test('subscriptions: every plan and every billing status gets the same features, and billing never touches dismissal', async () => {
+  const { admin, billing } = await subscriptionSchool();
+  const paths = ['/admin/setup', '/admin/students', '/admin/guardians', '/admin/queue', '/admin/overview', '/admin/audit-logs', '/me/school', '/notices', '/admin/subscription'];
+  const statuses = async () => Object.fromEntries(await Promise.all(paths.map(async path => [path, (await apiCall('GET', path, admin.token)).status])));
+  const count = (await db.prepare(`SELECT COUNT(*)::int AS n FROM students WHERE school_id='school-b' AND status='ACTIVE'`).get()).n;
+  const baseline = await statuses();
+  assert.ok(Object.values(baseline).filter(status => status === 200).length >= 6, JSON.stringify(baseline));
+  for (const planId of ['plan-starter', 'plan-growth', 'plan-professional', 'plan-enterprise']) {
+    for (const status of ['TRIALING', 'ACTIVE', 'PAST_DUE', 'CANCELED']) {
+      if (planId === 'plan-starter' && count > 150) continue;
+      const put = await apiCall('PUT', '/superadmin/billing/schools/school-b/subscription', billing.token, { planId, status, priceCents: planId === 'plan-enterprise' ? 45000 : undefined, reason: 'Contract' });
+      assert.equal(put.status, 204, `${planId} ${status}`);
+      assert.deepEqual(await statuses(), baseline, `${planId} ${status}: same access as any other plan`);
+    }
+  }
+  // A full plan (and an unpaid one) still lets a parent request a pickup and a teacher see the queue.
+  const starter = await apiCall('PUT', '/superadmin/billing/schools/school-default/subscription', billing.token, { planId: 'plan-starter', status: 'PAST_DUE' });
+  assert.equal(starter.status, 204);
+  const parent = await login('morgan@school.test', 'password');
+  assert.equal((await apiCall('GET', '/me/students', parent.token)).status, 200);
+  assert.equal((await apiCall('GET', '/teacher/queue', (await login('teacher@school.test', 'password')).token)).status, 200);
+  assert.equal((await apiCall('POST', '/me/pin/change', parent.token, { currentPin: '000000', newPin: '000000' })).status !== 402, true);
+
+  // Subscription pages follow the same roles and tenant walls as everything else.
+  for (const who of ['teacher@school.test', 'morgan@school.test']) {
+    const token = (await login(who, 'password')).token;
+    assert.equal((await apiCall('GET', '/admin/subscription', token)).status, 403);
+    assert.equal((await apiCall('POST', '/admin/subscription/requests', token, { type: 'CANCEL', confirm: true })).status, 403);
+  }
+  assert.equal((await apiCall('GET', '/admin/subscription')).status, 401);
+  const crossSchool = await fetch(`${apiBaseUrl}/api/admin/subscription`, { headers: { Authorization: `Bearer ${admin.token}`, 'X-School-ID': 'school-default' } });
+  assert.equal(crossSchool.status, 403);
+  assert.equal((await apiCall('GET', '/superadmin/billing/requests', admin.token)).status, 403);
+  assert.equal((await apiCall('PUT', '/superadmin/billing/schools/school-b/subscription', admin.token, { planId: 'plan-enterprise', status: 'ACTIVE', priceCents: 0, reason: 'x' })).status, 403, 'a school cannot set its own plan');
+  assert.equal((await apiCall('PUT', '/superadmin/billing/settings', (await login('platform-2@test.local', 'password')).token, { graceDays: 1 })).status, 403);
+  const own = await (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  assert.ok(own.invoices.every(invoice => invoice.status !== 'DRAFT'));
+  assert.doesNotMatch(JSON.stringify(own), /school-default|Demo School/);
+});
+
+test('subscriptions: schools ask for changes, the platform approves, and agreed prices are kept', async () => {
+  const { admin, billing, active, fillTo, setPlan } = await subscriptionSchool();
+  // Start from an empty school: everyone from the earlier tests is removed (archived students don't count).
+  await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at='2026-01-01 00:00:00' WHERE school_id='school-b' AND status<>'ARCHIVED'`).run();
+  await db.prepare(`DELETE FROM subscription_requests WHERE school_id='school-b'`).run();
+  assert.equal((await setPlan('plan-starter', { currentPeriodEnd: '2099-06-30' })).status, 204);
+  await fillTo(140);
+  const request = body => apiCall('POST', '/admin/subscription/requests', admin.token, body);
+  const view = async () => (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  const near = await view();
+  assert.deepEqual([near.percentUsed, near.level, near.plans.find(plan => plan.recommended).id], [93, 'CLOSE', 'plan-growth']);
+  assert.equal(near.subscription.priceCents, 4900);
+
+  // Billing changes need an explicit confirmation, a real plan, and one request at a time.
+  assert.equal((await (await request({ type: 'CHANGE_PLAN', planId: 'plan-growth', interval: 'YEAR' })).json()).code, 'CONFIRMATION_REQUIRED');
+  assert.equal((await request({ type: 'CHANGE_PLAN', planId: 'no-such-plan', interval: 'YEAR', confirm: true })).status, 400);
+  assert.equal((await request({ type: 'CHANGE_PLAN', planId: 'plan-starter', interval: 'MONTH', confirm: true })).status, 400, 'already on it');
+  const asked = await request({ type: 'CHANGE_PLAN', planId: 'plan-growth', interval: 'YEAR', note: 'We are growing', confirm: true });
+  assert.equal(asked.status, 201);
+  assert.equal((await (await request({ type: 'CANCEL', confirm: true })).json()).code, 'REQUEST_OPEN');
+  assert.equal((await view()).openRequest.planName, 'Growth');
+  assert.equal((await view()).subscription.planId, 'plan-starter', 'nothing changes until it is approved');
+
+  // The platform sees it, with what it would cost, and approves it.
+  const open = await (await apiCall('GET', '/superadmin/billing/requests', billing.token)).json();
+  const mine = open.find(r => r.schoolId === 'school-b');
+  assert.deepEqual([mine.type, mine.planName, mine.interval, mine.priceCents, mine.students], ['CHANGE_PLAN', 'Growth', 'YEAR', 99000, 140]);
+  assert.equal((await apiCall('POST', `/superadmin/billing/requests/${mine.id}/resolve`, billing.token, { approve: false })).status, 400, 'declining needs a reason');
+  assert.equal((await apiCall('POST', `/superadmin/billing/requests/${mine.id}/resolve`, billing.token, { approve: true })).status, 204);
+  assert.equal((await apiCall('POST', `/superadmin/billing/requests/${mine.id}/resolve`, billing.token, { approve: true })).status, 404, 'only once');
+  const upgraded = await view();
+  assert.deepEqual([upgraded.subscription.planId, upgraded.subscription.interval, upgraded.subscription.priceCents, upgraded.subscription.status, upgraded.studentLimit, upgraded.openRequest],
+    ['plan-growth', 'YEAR', 99000, 'ACTIVE', 500, null]);
+  assert.ok(await waitForAudit(`action='SUBSCRIPTION_CHANGE_REQUESTED' AND school_id='school-b'`, []));
+  assert.ok(await waitForAudit(`action='SUBSCRIPTION_REQUEST_APPROVED' AND school_id='school-b'`, []));
+
+  // Raising the plan's price is recorded, and does not change what this school pays.
+  assert.equal((await apiCall('PATCH', '/superadmin/billing/plans/plan-growth', billing.token, { monthlyPriceCents: 12900, annualPriceCents: 129000 })).status, 204);
+  assert.equal((await view()).subscription.priceCents, 99000, 'the school keeps the price it agreed');
+  assert.equal((await view()).plans.find(plan => plan.id === 'plan-growth').annualPriceCents, 129000, 'new subscribers see the new price');
+  const history = await (await apiCall('GET', '/superadmin/billing/plans/plan-growth/history', billing.token)).json();
+  assert.deepEqual([history[0].monthlyPriceCents, history[0].annualPriceCents, history[0].changedBy], [12900, 129000, 'Platform BILLING_ADMIN']);
+  assert.equal((await apiCall('PATCH', '/superadmin/billing/plans/plan-growth', billing.token, { studentLimit: 100 })).status, 409, 'a limit cannot drop below a school already on the plan');
+  assert.equal((await apiCall('PATCH', '/superadmin/billing/plans/plan-growth', billing.token, { monthlyPriceCents: 9900, annualPriceCents: 99000 })).status, 204);
+  assert.ok(await waitForAudit(`action='BILLING_PLAN_UPDATED' AND target_id='plan-growth'`, []));
+
+  // A discount is a price different from the plan's, and needs a reason.
+  const discount = await setPlan('plan-growth', { interval: 'YEAR', priceCents: 79000 });
+  assert.equal((await discount.json()).code, 'REASON_REQUIRED');
+  assert.equal((await setPlan('plan-growth', { interval: 'YEAR', priceCents: 79000, reason: 'Founding school discount', currentPeriodEnd: '2099-06-30' })).status, 204);
+  assert.equal((await view()).subscription.priceCents, 79000);
+  const discounted = await waitForAudit(`action='SUBSCRIPTION_CHANGED' AND school_id='school-b' AND details LIKE '%79000%'`, []);
+  assert.match(discounted.reason ?? discounted.details, /Founding school discount/);
+
+  // Recurring revenue counts paying schools at the price each agreed.
+  const summary = await (await apiCall('GET', '/superadmin/billing/summary', billing.token)).json();
+  assert.equal(summary.annualRecurringCents, summary.monthlyRecurringCents * 12);
+  assert.ok(summary.monthlyRecurringCents >= Math.round(79000 / 12));
+  const filtered = await (await apiCall('GET', '/superadmin/billing/subscriptions?planId=plan-growth&status=ACTIVE&renewsBefore=2099-12-31', billing.token)).json();
+  assert.deepEqual(filtered.items.filter(row => row.schoolId === 'school-b').map(row => [row.priceCents, row.agreedPrice, row.interval, row.studentLimit, row.students]), [[79000, true, 'YEAR', 500, 140]]);
+
+  // A smaller plan than the school needs is refused; a downgrade that fits can be asked for.
+  await fillTo(151);
+  assert.equal((await (await request({ type: 'CHANGE_PLAN', planId: 'plan-starter', interval: 'MONTH', confirm: true })).json()).code, 'PLAN_TOO_SMALL');
+  assert.equal(await active(), 151);
+
+  // Withdrawing, declining, and cancelling at the end of the paid period.
+  const second = await (await request({ type: 'CHANGE_PLAN', planId: 'plan-professional', interval: 'MONTH', confirm: true })).json();
+  assert.equal((await apiCall('DELETE', `/admin/subscription/requests/${second.id}`, admin.token)).status, 204);
+  const third = await (await request({ type: 'CHANGE_PLAN', planId: 'plan-professional', interval: 'MONTH', confirm: true })).json();
+  assert.equal((await apiCall('POST', `/superadmin/billing/requests/${third.id}/resolve`, billing.token, { approve: false, note: 'Please call us first.' })).status, 204);
+  assert.equal((await view()).requests.find(r => r.id === third.id).resolutionNote, 'Please call us first.', 'the school sees why');
+  assert.equal((await view()).subscription.planId, 'plan-growth');
+  const cancel = await (await request({ type: 'CANCEL', note: 'Closing the school', confirm: true })).json();
+  assert.equal((await apiCall('POST', `/superadmin/billing/requests/${cancel.id}/resolve`, billing.token, { approve: true })).status, 204);
+  const ending = await view();
+  assert.deepEqual([ending.subscription.status, ending.subscription.cancelAtPeriodEnd, ending.subscription.currentPeriodEnd], ['ACTIVE', true, '2099-06-30']);
+  const { finishCancellations } = await import('../schoolBilling.js');
+  await finishCancellations();
+  assert.equal((await view()).subscription.status, 'ACTIVE', 'still paid up: nothing ends early');
+  await db.prepare(`UPDATE subscriptions SET current_period_end='2020-01-01' WHERE school_id='school-b'`).run();
+  assert.equal(await finishCancellations(), 1);
+  assert.equal((await view()).subscription.status, 'CANCELED');
+  assert.equal((await apiCall('GET', '/admin/students', admin.token)).status, 200, 'a canceled school keeps its records');
 });
