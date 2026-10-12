@@ -18,6 +18,11 @@ export function configWarnings(env = process.env) {
   if (!env.AWS_S3_BUCKET) warnings.push({ setting: 'AWS_S3_BUCKET', severity: 'medium', message: 'File storage is not set up, so photos and school logos are saved inside the database. Set AWS_S3_BUCKET, AWS_REGION and the AWS access keys.' });
   else if (!env.AWS_ACCESS_KEY_ID || !env.AWS_SECRET_ACCESS_KEY) warnings.push({ setting: 'AWS_ACCESS_KEY_ID', severity: 'high', message: 'A storage bucket is set but the AWS access keys are missing, so photos and logos cannot be saved or shown.' });
   if (env.REQUIRE_EMAIL_CONFIRMATION === 'false') warnings.push({ setting: 'REQUIRE_EMAIL_CONFIRMATION', severity: 'high', message: 'New schools can register without confirming their email address. Remove this setting in production.' });
+  if (!env.STRIPE_SECRET_KEY) warnings.push({ setting: 'STRIPE_SECRET_KEY', severity: 'medium', message: 'Online payment is not set up, so schools ask for plan changes instead of paying by card.' });
+  else {
+    if (!env.STRIPE_WEBHOOK_SECRET) warnings.push({ setting: 'STRIPE_WEBHOOK_SECRET', severity: 'critical', message: 'Payments can be taken but the server is never told about them. Set the webhook signing secret from Stripe.' });
+    if (env.STRIPE_SECRET_KEY.startsWith('sk_test_')) warnings.push({ setting: 'STRIPE_SECRET_KEY', severity: 'high', message: 'Stripe is in test mode: no real payments are taken.' });
+  }
   if (env.PGSSL === 'false') warnings.push({ setting: 'PGSSL', severity: 'high', message: 'The database connection is not encrypted.' });
   if (!env.TRUST_PROXY && !env.RAILWAY_ENVIRONMENT) warnings.push({ setting: 'TRUST_PROXY', severity: 'medium', message: 'HTTPS is not enforced unless the server knows it is behind a TLS proxy.' });
   return warnings;

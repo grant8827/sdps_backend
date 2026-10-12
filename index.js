@@ -17,6 +17,7 @@ import { MAX_LOGO_DATA_URL_LENGTH, imageHosts, parseImageDataUrl, removeStoredIm
 import { CODE_MINUTES, checkEmailCode, createEmailCode, discardEmailCode, emailConfirmationRequired, sweepEmailCodes } from './emailCodes.js';
 import { StudentLimitError, assertRoomForStudent, recordEnrollment, startTrial, studentLimitResponse } from './subscriptions.js';
 import { registerSchoolBilling, startBillingSweeper } from './schoolBilling.js';
+import { stripeWebhook } from './stripeBilling.js';
 import { ADMIN_RESET_TTL_MS, claimPinLink, createAccountLink, findAccountLink, unusablePasswordHash, useAccountLink } from './accountLinks.js';
 import { checkPin, hasPin, pinProblem, setPin } from './pickupPin.js';
 import {
@@ -220,6 +221,11 @@ async function geocodeAddress(address) {
   }
   throw new Error('That address could not be mapped. Confirm the street, city, state, ZIP/postal code, and country, then try again.');
 }
+
+// Stripe's webhook needs the request body exactly as sent (its
+// signature covers the raw bytes), so it is registered before the JSON
+// parser below. See stripeBilling.js.
+app.post('/api/billing/stripe/webhook', express.raw({ type: () => true, limit: '1mb' }), asyncRoute(stripeWebhook));
 
 // Higher than Express's 100kb default so a student photo (sent as a
 // base64 data URL in the JSON body — no file-upload middleware in this

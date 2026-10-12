@@ -207,7 +207,7 @@ export function registerPlatformBilling(router) {
         p.id AS "planId", p.name AS "planName", p.student_limit AS "studentLimit", (p.custom_pricing = 1) AS "customPricing",
         COALESCE(sub.billing_interval, 'MONTH') AS "interval",
         COALESCE(sub.price_cents, CASE WHEN COALESCE(sub.billing_interval,'MONTH')='YEAR' THEN p.annual_price_cents ELSE p.monthly_price_cents END) AS "priceCents",
-        (sub.price_cents IS NOT NULL) AS "agreedPrice", sub.trial_ends_on AS "trialEndsOn", (sub.cancel_at_period_end = 1) AS "cancelAtPeriodEnd",
+        (sub.price_cents IS NOT NULL) AS "agreedPrice", (sub.external_provider='stripe' AND sub.external_id IS NOT NULL AND sub.status <> 'CANCELED') AS "paidOnline", sub.trial_ends_on AS "trialEndsOn", (sub.cancel_at_period_end = 1) AS "cancelAtPeriodEnd",
         sub.started_on AS "startedOn", sub.current_period_end AS "currentPeriodEnd", sub.notes,
         (SELECT COUNT(*)::int FROM students st WHERE st.school_id=s.id AND st.status='ACTIVE') AS students
       FROM schools s LEFT JOIN subscriptions sub ON sub.school_id=s.id LEFT JOIN plans p ON p.id=sub.plan_id
@@ -230,6 +230,10 @@ export function registerPlatformBilling(router) {
     const status = SUBSCRIPTION_STATUSES.includes(req.body.status) ? req.body.status : null;
     if (!plan || !status) return res.status(400).json({ error: 'Choose a plan and a status.' });
     const before = await db.prepare(`SELECT sub.plan_id, p.name AS plan, sub.status, sub.billing_interval, sub.price_cents, sub.trial_ends_on, sub.current_period_end, sub.started_on FROM subscriptions sub JOIN plans p ON p.id=sub.plan_id WHERE sub.school_id=?`).get(school.id);
+    // A school paying by card is kept in step with Stripe; changing it here
+    // would be overwritten by (or disagree with) what Stripe charges.
+    const stripeManaged = await db.prepare(`SELECT 1 FROM subscriptions WHERE school_id=? AND external_provider='stripe' AND external_id IS NOT NULL AND status <> 'CANCELED'`).get(school.id);
+    if (stripeManaged) return res.status(409).json({ error: `${school.name} pays by card through Stripe. Change or cancel its subscription in Stripe (or ask the school to on its Subscription page); this page updates by itself.`, code: 'STRIPE_MANAGED' });
     const interval = ['MONTH', 'YEAR'].includes(req.body.interval) ? req.body.interval : before?.billing_interval ?? 'MONTH';
     const startedOn = validDate(req.body.startedOn) ?? before?.started_on ?? today();
     if (req.body.currentPeriodEnd && !validDate(req.body.currentPeriodEnd)) return res.status(400).json({ error: 'The period end must be a date.' });
@@ -317,6 +321,9 @@ export function registerPlatformBilling(router) {
         if (!request) return null;
         const school = await db.prepare('SELECT id, name FROM schools WHERE id=?').get(request.school_id);
         const details = { type: request.type };
+        if (approve && await db.prepare(`SELECT 1 FROM subscriptions WHERE school_id=? AND external_provider='stripe' AND external_id IS NOT NULL AND status <> 'CANCELED'`).get(school.id)) {
+          throw Object.assign(new Error(`${school.name} pays by card through Stripe. Change or cancel its subscription in Stripe first, then answer this request.`), { status: 409 });
+        }
         if (approve && request.type === 'CHANGE_PLAN') {
           const plan = await db.prepare(`SELECT id, name, student_limit AS "studentLimit", monthly_price_cents AS "monthlyPriceCents", annual_price_cents AS "annualPriceCents", (custom_pricing = 1) AS "customPricing" FROM plans WHERE id=?`).get(request.plan_id);
           const { activeStudents } = await schoolCapacity(school.id);

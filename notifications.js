@@ -4,7 +4,7 @@ import { writeAudit } from './audit.js';
 import { db, id, pool, withTransaction } from './db.js';
 import {
   deliverLater, emailConfigured, sendAddedToSchoolEmail, sendGuardianApprovedEmail, sendGuardianDecisionEmail, sendInviteEmail,
-  sendMfaResetEmail, sendNoticeEmail, sendPasswordChangedEmail, sendPasswordResetEmail, sendPinChangedEmail, sendPinResetEmail,
+  sendMfaResetEmail, sendNoticeEmail, sendPasswordChangedEmail, sendPasswordResetEmail, sendPaymentFailedEmail, sendPinChangedEmail, sendPinResetEmail,
   sendSchoolWelcomeEmail,
 } from './mailer.js';
 import { requirePlatformPermission } from './permissions.js';
@@ -89,6 +89,7 @@ async function resend(delivery) {
       if (!user) throw Object.assign(new Error('That account no longer exists or is disabled.'), { status: 409 });
       return sendPinResetEmail({ ...base, link: await createAccountLink(user.id, 'PIN_RESET') });
     case 'pinChanged': return sendPinChangedEmail(base);
+    case 'paymentFailed': return sendPaymentFailedEmail(base);
     case 'addedToSchool': return sendAddedToSchoolEmail(base);
     case 'passwordChanged': return sendPasswordChangedEmail(base);
     case 'mfaReset': return sendMfaResetEmail(base);
@@ -99,7 +100,7 @@ async function resend(delivery) {
   }
 }
 
-const TEMPLATE_NAMES = ['invite', 'addedToSchool', 'passwordReset', 'passwordChanged', 'pinReset', 'pinChanged', 'emailCode', 'mfaReset', 'schoolWelcome', 'guardianDecision', 'guardianApproved', 'notice'];
+const TEMPLATE_NAMES = ['invite', 'addedToSchool', 'passwordReset', 'passwordChanged', 'pinReset', 'pinChanged', 'emailCode', 'paymentFailed', 'mfaReset', 'schoolWelcome', 'guardianDecision', 'guardianApproved', 'notice'];
 
 export function registerPlatformNotifications(router) {
   router.get('/notifications/summary', requirePlatformPermission('platform:view'), asyncRoute(async (req, res) => {

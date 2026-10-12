@@ -1592,6 +1592,7 @@ test('production settings that are unsafe are flagged without printing their val
     RAILWAY_ENVIRONMENT: 'production', MFA_ENCRYPTION_KEY: 'k', PUBLIC_APP_URL: 'https://www.sdpmplus.com',
     SMTP_HOST: 'h', SMTP_PORT: '587', SMTP_USER: 'u', SMTP_PASSWORD: 'p', SMTP_FROM: 'f',
     AWS_S3_BUCKET: 'b', AWS_ACCESS_KEY_ID: 'a', AWS_SECRET_ACCESS_KEY: 's',
+    STRIPE_SECRET_KEY: 'sk_live_x', STRIPE_WEBHOOK_SECRET: 'whsec_x',
   });
   assert.deepEqual(clean, []);
 });
@@ -2073,4 +2074,275 @@ test('subscriptions: schools ask for changes, the platform approves, and agreed 
   assert.equal(await finishCancellations(), 1);
   assert.equal((await view()).subscription.status, 'CANCELED');
   assert.equal((await apiCall('GET', '/admin/students', admin.token)).status, 200, 'a canceled school keeps its records');
+});
+
+test('online payment: hosted checkout, a signed webhook applied once, plan changes, failed payments and cancellation', async () => {
+  const { createServer } = await import('node:http');
+  const { default: Stripe } = await import('stripe');
+  const { admin, billing, fillTo, add } = await subscriptionSchool();
+  const view = async () => (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  const checkout = body => apiCall('POST', '/admin/subscription/checkout', admin.token, body);
+
+  // Not set up: card payment is not offered, and the webhook does nothing.
+  assert.equal((await (await checkout({ planId: 'plan-growth', interval: 'MONTH', confirm: true })).json()).code, 'ONLINE_PAYMENT_OFF');
+  assert.equal((await fetch(`${apiBaseUrl}/api/billing/stripe/webhook`, { method: 'POST', body: '{}' })).status, 503);
+  assert.equal((await view()).onlinePayment, false);
+
+  // A stand-in for Stripe's API: remembers what it was asked and keeps one subscription.
+  const calls = [];
+  const stripeSub = {
+    id: 'sub_test_1', object: 'subscription', status: 'active', customer: 'cus_test_1', cancel_at_period_end: false, trial_end: null,
+    current_period_end: Math.floor(Date.parse('2099-03-01T00:00:00Z') / 1000),
+    metadata: { school_id: 'school-b', plan_id: 'plan-growth', interval: 'MONTH' },
+    items: { data: [{ id: 'si_1', price: { unit_amount: 9900, product: 'prod_growth', recurring: { interval: 'month' } } }] },
+  };
+  const fake = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const form = Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString()));
+      const path = req.url.split('?')[0];
+      calls.push({ method: req.method, path, form, idempotencyKey: req.headers['idempotency-key'], auth: req.headers.authorization });
+      const send = body => res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+      if (path === '/v1/products') return send({ id: `prod_${form['metadata[plan_id]']}`, object: 'product' });
+      if (path === '/v1/customers') return send({ id: 'cus_test_1', object: 'customer' });
+      if (path === '/v1/checkout/sessions') return send({ id: 'cs_test_1', object: 'checkout.session', url: 'https://checkout.stripe.test/pay/cs_test_1' });
+      if (path === '/v1/billing_portal/sessions') return send({ id: 'bps_1', object: 'billing_portal.session', url: 'https://billing.stripe.test/session/bps_1' });
+      if (path === '/v1/subscriptions/sub_test_1') {
+        if (req.method === 'POST') {
+          if (form.cancel_at_period_end !== undefined) stripeSub.cancel_at_period_end = form.cancel_at_period_end === 'true';
+          if (form['items[0][price_data][unit_amount]']) {
+            stripeSub.items.data[0].price = { unit_amount: Number(form['items[0][price_data][unit_amount]']), product: form['items[0][price_data][product]'], recurring: { interval: form['items[0][price_data][recurring][interval]'] } };
+            stripeSub.metadata = { school_id: form['metadata[school_id]'], plan_id: form['metadata[plan_id]'], interval: form['metadata[interval]'] };
+          }
+        }
+        return send(stripeSub);
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: { message: 'not found', type: 'invalid_request_error' } }));
+    });
+  }).listen(0);
+  await new Promise(resolve => fake.once('listening', resolve));
+  const secret = 'whsec_test_secret';
+  const saved = {};
+  for (const [name, value] of Object.entries({ STRIPE_SECRET_KEY: 'sk_test_fake', STRIPE_WEBHOOK_SECRET: secret, STRIPE_API_BASE: `http://127.0.0.1:${fake.address().port}`, PUBLIC_APP_URL: 'https://www.sdpmplus.com' })) {
+    saved[name] = process.env[name];
+    process.env[name] = value;
+  }
+  const signer = new Stripe('sk_test_fake');
+  let eventNumber = 0;
+  const webhook = async (type, object, { eventId = `evt_${++eventNumber}_${randomUUID()}`, signWith = secret } = {}) => {
+    const payload = JSON.stringify({ id: eventId, object: 'event', type, data: { object } });
+    const response = await fetch(`${apiBaseUrl}/api/billing/stripe/webhook`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Stripe-Signature': signer.webhooks.generateTestHeaderString({ payload, secret: signWith }) }, body: payload,
+    });
+    return { status: response.status, body: await response.json().catch(() => null), eventId };
+  };
+
+  try {
+    // School B: a free trial on Starter with 20 days left and 10 students.
+    await db.prepare(`UPDATE students SET status='ARCHIVED', archived_at='2026-01-01 00:00:00' WHERE school_id='school-b' AND status<>'ARCHIVED'`).run();
+    await db.prepare(`DELETE FROM subscription_requests WHERE school_id='school-b'`).run();
+    assert.equal((await apiCall('PUT', '/superadmin/billing/schools/school-b/subscription', billing.token, { planId: 'plan-starter', status: 'TRIALING', trialDays: 20 })).status, 204);
+    await fillTo(10);
+    assert.equal((await view()).onlinePayment, true);
+    assert.equal((await view()).paidOnline, false);
+
+    // Checkout needs a confirmation, a priced plan, and an administrator of this school.
+    assert.equal((await (await checkout({ planId: 'plan-growth', interval: 'MONTH' })).json()).code, 'CONFIRMATION_REQUIRED');
+    assert.equal((await (await checkout({ planId: 'plan-enterprise', interval: 'MONTH', confirm: true })).json()).code, 'CUSTOM_PRICING');
+    assert.equal((await apiCall('POST', '/admin/subscription/checkout', (await login('teacher@school.test', 'password')).token, { planId: 'plan-growth', interval: 'MONTH', confirm: true })).status, 403);
+    assert.equal(calls.length, 0, 'nothing reached Stripe');
+
+    const started = await checkout({ planId: 'plan-growth', interval: 'MONTH', confirm: true });
+    assert.equal(started.status, 200);
+    assert.equal((await started.json()).url, 'https://checkout.stripe.test/pay/cs_test_1');
+    const session = calls.find(call => call.path === '/v1/checkout/sessions');
+    assert.equal(session.auth, 'Bearer sk_test_fake');
+    assert.deepEqual([session.form.mode, session.form.customer, session.form.client_reference_id, session.form['line_items[0][price_data][unit_amount]'], session.form['line_items[0][price_data][recurring][interval]'], session.form['line_items[0][price_data][currency]']],
+      ['subscription', 'cus_test_1', 'school-b', '9900', 'month', 'usd']);
+    assert.deepEqual([session.form['metadata[school_id]'], session.form['subscription_data[metadata][plan_id]'], session.form.success_url], ['school-b', 'plan-growth', 'https://www.sdpmplus.com/admin/subscription?checkout=success']);
+    assert.ok(Number(session.form['subscription_data[trial_end]']) > Date.now() / 1000 + 18 * 86400, 'the rest of the free trial is kept');
+    assert.doesNotMatch(JSON.stringify(calls), /card|cvc|4242/i, 'no card details pass through this server');
+    // A double click gets the same checkout, not a second one.
+    await checkout({ planId: 'plan-growth', interval: 'MONTH', confirm: true });
+    const sessions = calls.filter(call => call.path === '/v1/checkout/sessions');
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions[0].idempotencyKey, sessions[1].idempotencyKey);
+    assert.equal(calls.filter(call => call.path === '/v1/customers').length, 1, 'one Stripe customer per school');
+    assert.equal((await view()).subscription.planId, 'plan-starter', 'nothing changes until Stripe confirms the payment');
+
+    // A webhook with a wrong or missing signature is refused and changes nothing.
+    assert.equal((await webhook('checkout.session.completed', { mode: 'subscription', subscription: 'sub_test_1', customer: 'cus_test_1' }, { signWith: 'whsec_someone_else' })).status, 400);
+    assert.equal((await fetch(`${apiBaseUrl}/api/billing/stripe/webhook`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: 'evt_forged', type: 'checkout.session.completed', data: { object: {} } }) })).status, 400);
+    assert.equal((await view()).subscription.planId, 'plan-starter');
+
+    // The real one creates the subscription — once.
+    const completed = await webhook('checkout.session.completed', { mode: 'subscription', subscription: 'sub_test_1', customer: 'cus_test_1' });
+    assert.deepEqual([completed.status, completed.body.duplicate], [200, false]);
+    const paid = await view();
+    assert.deepEqual([paid.subscription.planId, paid.subscription.status, paid.subscription.interval, paid.subscription.priceCents, paid.subscription.currentPeriodEnd, paid.studentLimit, paid.paidOnline],
+      ['plan-growth', 'ACTIVE', 'MONTH', 9900, '2099-03-01', 500, true]);
+    assert.ok(await waitForAudit(`action='SUBSCRIPTION_STARTED' AND school_id='school-b'`, []));
+    const replay = await webhook('checkout.session.completed', { mode: 'subscription', subscription: 'sub_test_1', customer: 'cus_test_1' }, { eventId: completed.eventId });
+    assert.deepEqual([replay.status, replay.body.duplicate], [200, true]);
+    assert.equal((await db.prepare(`SELECT COUNT(*)::int AS n FROM audit_logs WHERE action='SUBSCRIPTION_STARTED' AND school_id='school-b'`).get()).n, 1, 'a repeated event is not applied twice');
+    assert.equal(JSON.stringify(await db.prepare(`SELECT * FROM subscriptions WHERE school_id='school-b'`).get()).includes('sk_test'), false);
+
+    // A paid invoice is recorded once, with a link to Stripe's receipt page.
+    const stripeInvoice = { id: 'in_test_1', number: 'SDPM-0001', customer: 'cus_test_1', total: 9900, amount_paid: 9900, currency: 'usd', hosted_invoice_url: 'https://invoice.stripe.test/in_test_1', invoice_pdf: 'https://invoice.stripe.test/in_test_1.pdf', lines: { data: [{ description: '1 × SDPMPlus Growth', period: { start: 4070908800, end: 4073587200 } }] } };
+    assert.equal((await webhook('invoice.paid', stripeInvoice)).status, 200);
+    assert.equal((await webhook('invoice.paid', stripeInvoice)).status, 200, 'Stripe may send the same invoice in two events');
+    const invoices = (await view()).invoices;
+    assert.equal(invoices.length, 1);
+    assert.deepEqual([invoices[0].number, invoices[0].status, invoices[0].amountCents, invoices[0].paidCents, invoices[0].hostedUrl], ['SDPM-0001', 'PAID', 9900, 9900, 'https://invoice.stripe.test/in_test_1']);
+    assert.equal((await webhook('invoice.paid', { ...stripeInvoice, id: 'in_zero', number: 'SDPM-0000', total: 0, amount_paid: 0 })).status, 200);
+    assert.equal((await webhook('invoice.paid', { ...stripeInvoice, id: 'in_other', customer: 'cus_unknown' })).status, 200);
+    assert.equal((await view()).invoices.length, 1, 'a $0 invoice and an unknown customer are ignored');
+    const revenue = await (await apiCall('GET', '/superadmin/billing/summary', billing.token)).json();
+    assert.ok(revenue.monthlyRecurringCents >= 9900);
+
+    // While Stripe charges the school, the platform page can't put it on something else.
+    assert.equal((await (await apiCall('PUT', '/superadmin/billing/schools/school-b/subscription', billing.token, { planId: 'plan-starter', status: 'ACTIVE' })).json()).code, 'STRIPE_MANAGED');
+
+    // Already paying: choosing another plan or interval changes it at Stripe, pro-rated, with no second checkout.
+    assert.equal((await checkout({ planId: 'plan-growth', interval: 'MONTH', confirm: true })).status, 400, 'already on it');
+    const changed = await checkout({ planId: 'plan-professional', interval: 'YEAR', confirm: true });
+    assert.deepEqual(await changed.json(), { changed: true });
+    const update = calls.filter(call => call.method === 'POST' && call.path === '/v1/subscriptions/sub_test_1').at(-1);
+    assert.deepEqual([update.form['items[0][id]'], update.form['items[0][price_data][unit_amount]'], update.form['items[0][price_data][recurring][interval]'], update.form.proration_behavior], ['si_1', '199000', 'year', 'create_prorations']);
+    assert.equal(calls.filter(call => call.path === '/v1/checkout/sessions').length, 2, 'no new checkout');
+    const yearly = await view();
+    assert.deepEqual([yearly.subscription.planId, yearly.subscription.interval, yearly.subscription.priceCents, yearly.studentLimit], ['plan-professional', 'YEAR', 199000, 1000]);
+    await fillTo(600);
+    assert.equal((await (await checkout({ planId: 'plan-growth', interval: 'YEAR', confirm: true })).json()).code, 'PLAN_TOO_SMALL');
+
+    // Cancel at the end of the paid period, and change their mind.
+    const cancel = body => apiCall('POST', '/admin/subscription/cancel', admin.token, body);
+    assert.equal((await cancel({})).status, 400);
+    assert.equal((await cancel({ confirm: true })).status, 204);
+    assert.deepEqual([(await view()).subscription.status, (await view()).subscription.cancelAtPeriodEnd], ['ACTIVE', true]);
+    assert.equal((await (await apiCall('POST', '/admin/subscription/requests', admin.token, { type: 'CANCEL', confirm: true })).json()).code, 'PAID_ONLINE');
+    assert.equal((await cancel({ resume: true })).status, 204);
+    assert.equal((await view()).subscription.cancelAtPeriodEnd, false);
+    assert.equal((await (await apiCall('POST', '/admin/subscription/portal', admin.token)).json()).url, 'https://billing.stripe.test/session/bps_1');
+    assert.equal((await apiCall('POST', '/admin/subscription/portal', (await login('admin@school.test', 'password')).token)).status, 409, 'another school has no card on file');
+
+    // A failed renewal: marked overdue and recorded; dismissal is untouched.
+    assert.equal((await webhook('invoice.payment_failed', { ...stripeInvoice, id: 'in_test_2', number: 'SDPM-0002', amount_paid: 0, total: 199000 })).status, 200);
+    const overdue = await view();
+    assert.equal(overdue.subscription.status, 'PAST_DUE');
+    assert.deepEqual(overdue.invoices.map(invoice => [invoice.number, invoice.status]).sort(), [['SDPM-0001', 'PAID'], ['SDPM-0002', 'OPEN']]);
+    assert.ok(await waitForAudit(`action='PAYMENT_FAILED' AND school_id='school-b'`, []));
+    for (const path of ['/admin/queue', '/admin/students', '/admin/setup']) assert.equal((await apiCall('GET', path, admin.token)).status, 200);
+    assert.equal((await add()).status, 201, 'still within the paid period and grace: students can be added');
+    // Stripe retries, the payment goes through, and the subscription is active again.
+    assert.equal((await webhook('invoice.paid', { ...stripeInvoice, id: 'in_test_2', number: 'SDPM-0002', amount_paid: 199000, total: 199000 })).status, 200);
+    assert.equal((await webhook('customer.subscription.updated', stripeSub)).status, 200);
+    assert.equal((await view()).subscription.status, 'ACTIVE');
+    assert.deepEqual((await view()).invoices.map(invoice => invoice.status), ['PAID', 'PAID']);
+
+    // An event about a subscription that isn't the school's current one changes nothing.
+    assert.equal((await webhook('customer.subscription.deleted', { ...stripeSub, id: 'sub_old', status: 'canceled' })).status, 200);
+    assert.equal((await webhook('customer.subscription.updated', { ...stripeSub, id: 'sub_stranger', metadata: { school_id: 'no-such-school', plan_id: 'plan-starter' } })).status, 200);
+    assert.equal((await view()).subscription.status, 'ACTIVE');
+
+    // Stripe being unreachable is a clear message, and nothing is half-changed.
+    process.env.STRIPE_API_BASE = 'http://127.0.0.1:1';
+    const down = await checkout({ planId: 'plan-professional', interval: 'MONTH', confirm: true });
+    assert.equal(down.status, 502);
+    assert.equal((await down.json()).code, 'PAYMENT_PROVIDER_UNAVAILABLE');
+    assert.equal((await view()).subscription.interval, 'YEAR');
+    process.env.STRIPE_API_BASE = `http://127.0.0.1:${fake.address().port}`;
+
+    // The subscription ends at Stripe: canceled here, adding students stops, everything else works, and they can subscribe again.
+    stripeSub.status = 'canceled';
+    assert.equal((await webhook('customer.subscription.deleted', stripeSub)).status, 200);
+    const ended = await view();
+    assert.deepEqual([ended.subscription.status, ended.paidOnline, ended.lapsed], ['CANCELED', false, 'CANCELED']);
+    const blocked = await add('Late');
+    assert.equal(blocked.status, 409);
+    const blockedBody = await blocked.json();
+    assert.equal(blockedBody.code, 'SUBSCRIPTION_LAPSED');
+    assert.match(blockedBody.error, /subscription has ended, so Late Boundary was not added\. Drop-off, pickup, attendance and everything else keep working/);
+    for (const path of ['/admin/queue', '/admin/students', '/admin/export']) assert.equal((await apiCall('GET', path, admin.token)).status, 200, `${path} still works`);
+    assert.equal((await (await checkout({ planId: 'plan-professional', interval: 'MONTH', confirm: true })).json()).url, 'https://checkout.stripe.test/pay/cs_test_1');
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    await new Promise(resolve => fake.close(resolve));
+  }
+
+  // A free trial that ran out: adding students stops only after the grace period.
+  await db.prepare(`UPDATE subscriptions SET status='TRIALING', external_id=NULL, external_provider=NULL, trial_ends_on=?, current_period_end=? WHERE school_id='school-b'`).run('2020-01-01', '2020-01-01');
+  assert.equal((await view()).lapsed, 'TRIAL_ENDED');
+  assert.equal((await (await add('AfterTrial')).json()).code, 'SUBSCRIPTION_LAPSED');
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  await db.prepare(`UPDATE subscriptions SET trial_ends_on=? WHERE school_id='school-b'`).run(yesterday);
+  const inGrace = await view();
+  assert.deepEqual([inGrace.subscription.trialEnded, inGrace.lapsed], [true, null]);
+  assert.equal((await add('InGrace')).status, 201, 'within the grace period nothing is blocked');
+});
+
+test('sign-up flow: a public price list, and a new school chooses its trial plan or pays straight away', async () => {
+  // Anyone can read the price list; it holds nothing about any school.
+  const priceList = await fetch(`${apiBaseUrl}/api/plans`);
+  assert.equal(priceList.status, 200);
+  const { plans, trialDays } = await priceList.json();
+  assert.equal(trialDays, 30);
+  assert.deepEqual(plans.slice(0, 4).map(plan => [plan.name, plan.studentLimit, plan.monthlyPriceCents, plan.annualPriceCents]),
+    [['Starter', 150, 4900, 49000], ['Growth', 500, 9900, 99000], ['Professional', 1000, 19900, 199000], ['Enterprise', null, null, null]]);
+  assert.doesNotMatch(JSON.stringify(plans), /stripe|prod_|schoolId|customer/i);
+  const billing = await login('billing-1@test.local', 'password');
+  const retired = await (await apiCall('POST', '/superadmin/billing/plans', billing.token, { name: 'Hidden plan', studentLimit: 10, monthlyPriceCents: 100, annualPriceCents: 1000 })).json();
+  await apiCall('PATCH', `/superadmin/billing/plans/${retired.id}`, billing.token, { active: false });
+  assert.ok(!(await (await fetch(`${apiBaseUrl}/api/plans`)).json()).plans.some(plan => plan.name === 'Hidden plan'), 'retired plans are not shown');
+
+  // A new school picks which plan its free trial is on.
+  const email = `flow-${randomUUID()}@test.local`;
+  assert.equal((await apiCall('POST', '/auth/register-school', null, { schoolName: 'Flow School', campusName: 'Main', adminFullName: 'Flow Admin', email, password: 'password-1' })).status, 201);
+  const admin = await login(email, 'password-1');
+  const view = async () => (await apiCall('GET', '/admin/subscription', admin.token)).json();
+  const before = await view();
+  assert.equal((await apiCall('POST', '/admin/subscription/trial', admin.token, { planId: 'no-such-plan' })).status, 400);
+  assert.equal((await apiCall('POST', '/admin/subscription/trial', admin.token, { planId: 'plan-starter', interval: 'YEAR' })).status, 204);
+  const chosen = await view();
+  assert.deepEqual([chosen.subscription.planId, chosen.subscription.status, chosen.subscription.interval, chosen.studentLimit, chosen.subscription.trialEndsOn],
+    ['plan-starter', 'TRIALING', 'YEAR', 150, before.subscription.trialEndsOn], 'the plan changes, the trial dates do not');
+  assert.equal((await apiCall('POST', '/admin/subscription/trial', (await login('teacher@school.test', 'password')).token, { planId: 'plan-starter' })).status, 403);
+  // A school that is not in a trial can't use this to change plan for free.
+  const schoolB = await login('admin-b@test.local', 'password');
+  await db.prepare(`UPDATE subscriptions SET status='ACTIVE', trial_ends_on=NULL WHERE school_id='school-b'`).run();
+  assert.equal((await (await apiCall('POST', '/admin/subscription/trial', schoolB.token, { planId: 'plan-enterprise' })).json()).code, 'NOT_IN_TRIAL');
+
+  // "Subscribe now" from sign-up: no trial is carried over, and paying leads to the dashboard.
+  const { createServer } = await import('node:http');
+  const sessions = [];
+  const fake = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const form = Object.fromEntries(new URLSearchParams(Buffer.concat(chunks).toString()));
+      const path = req.url.split('?')[0];
+      if (path === '/v1/checkout/sessions') sessions.push(form);
+      const body = path === '/v1/products' ? { id: 'prod_flow' } : path === '/v1/customers' ? { id: `cus_flow_${randomUUID()}` } : { id: 'cs_flow', url: 'https://checkout.stripe.test/pay/cs_flow' };
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(body));
+    });
+  }).listen(0);
+  await new Promise(resolve => fake.once('listening', resolve));
+  const saved = {};
+  for (const [name, value] of Object.entries({ STRIPE_SECRET_KEY: 'sk_test_fake', STRIPE_WEBHOOK_SECRET: 'whsec_x', STRIPE_API_BASE: `http://127.0.0.1:${fake.address().port}`, PUBLIC_APP_URL: 'https://www.sdpmplus.com' })) {
+    saved[name] = process.env[name];
+    process.env[name] = value;
+  }
+  try {
+    const now = await apiCall('POST', '/admin/subscription/checkout', admin.token, { planId: 'plan-growth', interval: 'MONTH', confirm: true, startNow: true, returnTo: 'dashboard' });
+    assert.equal((await now.json()).url, 'https://checkout.stripe.test/pay/cs_flow');
+    assert.equal(sessions[0]['subscription_data[trial_end]'], undefined, 'billing starts today');
+    assert.deepEqual([sessions[0].success_url, sessions[0].cancel_url], ['https://www.sdpmplus.com/admin?checkout=success', 'https://www.sdpmplus.com/admin/choose-plan?checkout=cancelled']);
+    await apiCall('POST', '/admin/subscription/checkout', admin.token, { planId: 'plan-growth', interval: 'MONTH', confirm: true, returnTo: 'https://evil.example/steal' });
+    assert.ok(Number(sessions[1]['subscription_data[trial_end]']) > 0, 'without startNow the rest of the trial is kept');
+    assert.equal(sessions[1].success_url, 'https://www.sdpmplus.com/admin/subscription?checkout=success', 'the return address is never taken from the request');
+  } finally {
+    for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    await new Promise(resolve => fake.close(resolve));
+  }
 });

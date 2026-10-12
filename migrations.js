@@ -933,6 +933,28 @@ const migrations = [
       }
     },
   },
+  {
+    version: 36,
+    name: 'online payment (Stripe): customer and product ids, invoice links, events already applied',
+    async up(db) {
+      // Only Stripe's ids are kept, never anything about a card.
+      // stripe_events makes each webhook event apply once.
+      await db.exec(`
+        ALTER TABLE schools ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+        ALTER TABLE plans ADD COLUMN IF NOT EXISTS stripe_product_id TEXT;
+        ALTER TABLE invoices ADD COLUMN IF NOT EXISTS hosted_url TEXT;
+        ALTER TABLE invoices ADD COLUMN IF NOT EXISTS pdf_url TEXT;
+        CREATE UNIQUE INDEX IF NOT EXISTS schools_stripe_customer_idx ON schools(stripe_customer_id) WHERE stripe_customer_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_external_idx ON subscriptions(external_id) WHERE external_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS invoices_external_idx ON invoices(external_id) WHERE external_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS stripe_events (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

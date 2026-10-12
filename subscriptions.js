@@ -15,6 +15,10 @@ import { db, id, pool } from './db.js';
 //   pickup and attendance never depend on any of this.
 // - A school with no subscription at all (schools from before billing)
 //   has no limit until the platform gives it a plan.
+// - When a subscription has lapsed (canceled; or a trial or an unpaid
+//   period that ended more than the grace period ago) the one thing
+//   that stops is ADDING students. Everything else keeps working, and a
+//   school can always export its own data.
 // - A new school starts a free trial (no card) on the trial plan.
 
 export const DEFAULT_SETTINGS = { trialDays: 30, graceDays: 14, trialPlanId: 'plan-professional' };
@@ -88,12 +92,31 @@ export async function schoolCapacity(schoolId) {
     const trialDaysLeft = rest.status === 'TRIALING' && rest.trialEndsOn ? Math.max(0, Math.round((Date.parse(rest.trialEndsOn) - Date.parse(today())) / 86400000)) : null;
     view = { ...rest, interval, priceCents, trialDaysLeft, trialEnded: rest.status === 'TRIALING' && Boolean(rest.trialEndsOn) && rest.trialEndsOn < today() };
   }
+  const lapsed = subscription ? lapsedReason(subscription, (await billingSettings()).graceDays) : null;
   return {
-    subscription: view, activeStudents, studentLimit,
+    subscription: view, activeStudents, studentLimit, lapsed,
     remaining: studentLimit === null ? null : Math.max(0, studentLimit - activeStudents),
     percentUsed, level,
   };
 }
+
+/**
+ * Why a subscription no longer allows adding students, or null.
+ * 'CANCELED' | 'TRIAL_ENDED' | 'PAYMENT_OVERDUE' — the last two only
+ * once the grace period after the trial / paid period has also passed.
+ */
+export function lapsedReason(subscription, graceDays) {
+  if (subscription.status === 'CANCELED') return 'CANCELED';
+  const graceOver = date => Boolean(date) && addDays(date, graceDays) < today();
+  if (subscription.status === 'TRIALING' && graceOver(subscription.trialEndsOn)) return 'TRIAL_ENDED';
+  if (subscription.status === 'PAST_DUE' && graceOver(subscription.currentPeriodEnd)) return 'PAYMENT_OVERDUE';
+  return null;
+}
+const LAPSED_MESSAGE = {
+  CANCELED: "Your school's subscription has ended",
+  TRIAL_ENDED: "Your school's free trial has ended",
+  PAYMENT_OVERDUE: "Your school's subscription payment is overdue",
+};
 
 export class StudentLimitError extends Error {
   constructor(message, details) {
@@ -112,8 +135,19 @@ export class StudentLimitError extends Error {
 export async function assertRoomForStudent(schoolId, studentName = 'This student') {
   await db.prepare('SELECT pg_advisory_xact_lock(hashtext(?))').get(`students:${schoolId}`);
   const plan = await db.prepare(`
-    SELECT p.name, p.student_limit AS "studentLimit" FROM subscriptions sub JOIN plans p ON p.id=sub.plan_id WHERE sub.school_id=?`).get(schoolId);
-  if (!plan || plan.studentLimit === null) return;
+    SELECT p.name, p.student_limit AS "studentLimit", sub.status, sub.trial_ends_on AS "trialEndsOn", sub.current_period_end AS "currentPeriodEnd"
+    FROM subscriptions sub JOIN plans p ON p.id=sub.plan_id WHERE sub.school_id=?`).get(schoolId);
+  if (!plan) return;
+  const lapsed = lapsedReason(plan, (await billingSettings()).graceDays);
+  if (lapsed) {
+    const error = new StudentLimitError(
+      `${LAPSED_MESSAGE[lapsed]}, so ${studentName} was not added. Drop-off, pickup, attendance and everything else keep working. To add students, an administrator can choose a plan under Subscription.`,
+      { planName: plan.name, reason: lapsed },
+    );
+    error.code = 'SUBSCRIPTION_LAPSED';
+    throw error;
+  }
+  if (plan.studentLimit === null) return;
   const activeStudents = await activeStudentCount(schoolId);
   if (activeStudents < plan.studentLimit) return;
   throw new StudentLimitError(

@@ -231,6 +231,23 @@ export function sendEmailCodeEmail({ to, code, minutes }) {
   }, { template: 'emailCode', args: {} });
 }
 
+/** A card payment for the school's subscription didn't go through. No amounts or card details. */
+export function sendPaymentFailedEmail({ to, fullName, schoolName, retryOf }) {
+  const log = { template: 'paymentFailed', retryOf, args: { fullName, schoolName } };
+  return deliver(to, `Payment problem for ${schoolName} on SDPMPlus`, {
+    preheader: 'A subscription payment did not go through. Please check the card on file.',
+    heading: "A payment didn't go through",
+    paragraphs: [
+      `Hello ${fullName},`,
+      `We couldn't take the latest subscription payment for ${schoolName}. This is usually an expired card or a card the bank declined.`,
+      'Drop-off, pickup and attendance keep working as normal. We will try the payment again over the next few days.',
+      'Please open the Subscription page and update the card on file.',
+    ],
+    button: { label: 'Open Subscription', url: `${appBaseUrl()}/admin/subscription` },
+    schoolName,
+  }, log);
+}
+
 /** Security notice after the pickup PIN is created, changed or reset. */
 export function sendPinChangedEmail({ to, fullName, retryOf }) {
   const log = { template: 'pinChanged', retryOf, args: { fullName } };
