@@ -2132,6 +2132,28 @@ app.get('/api/me/notices', requireAuth, requireRole('parent'), asyncRoute(async 
     ORDER BY n.created_at DESC`).all(req.user.id, req.user.id, req.user.id, req.user.id));
 }));
 
+// Sent box — every notice this user sent themselves, any role, with a
+// ready-to-show recipient label (the inbox routes above only ever
+// return what was addressed TO the viewer). Scoped to the school being
+// worked in when one is named (X-School-ID), same as sending is.
+app.get('/api/notices/sent', requireAuth, asyncRoute(async (req, res) => {
+  const requestedSchoolId = req.headers['x-school-id'] || '';
+  res.json(await db.prepare(`
+    SELECT n.id, n.title, n.body, n.created_at AS "createdAt",
+      CASE n.target_type
+        WHEN 'SCHOOL' THEN 'All Parents'
+        WHEN 'CLASS' THEN 'All Class Parents'
+        WHEN 'ADMIN' THEN 'School Office'
+        WHEN 'PARENT' THEN COALESCE(p.full_name, 'Parent')
+        ELSE COALESCE(s.full_name, 'All Staff')
+      END AS recipient
+    FROM notices n
+    LEFT JOIN users p ON p.id=n.target_parent_user_id
+    LEFT JOIN users s ON s.id=n.target_staff_user_id
+    WHERE n.sender_user_id=? AND (?='' OR n.school_id=?)
+    ORDER BY n.created_at DESC`).all(req.user.id, requestedSchoolId, requestedSchoolId));
+}));
+
 // Any signed-in role can mark a notice read — read state is scoped to
 // req.user.id regardless of role, so a parent marking their own feed
 // and an admin marking theirs both just work here.

@@ -110,6 +110,16 @@ test('parent messaging is limited to their children\'s teachers and the admin', 
   assert.equal(validAdmin.status, 204);
   const adminNotice = await db.prepare('SELECT target_type FROM notices WHERE title=?').get(adminTitle);
   assert.deepEqual(adminNotice, { target_type: 'ADMIN' });
+
+  // Sent box: the parent sees exactly what they sent, labelled with who it went to.
+  const sent = await (await apiCall('GET', '/notices/sent', session.token)).json();
+  assert.equal(sent.find(n => n.title === adminTitle).recipient, 'School Office');
+  assert.ok(sent.find(n => n.title === teacherTitle).recipient);
+  assert.notEqual(sent.find(n => n.title === teacherTitle).recipient, 'All Staff');
+  // ...and nobody else's Sent box has it.
+  const teacherSent = await (await apiCall('GET', '/notices/sent', (await login('teacher@school.test', 'password')).token)).json();
+  assert.ok(!teacherSent.some(n => n.title === adminTitle || n.title === teacherTitle));
+  assert.equal((await apiCall('GET', '/notices/sent')).status, 401);
 });
 
 test('existing users are backfilled into the default school', async () => {
