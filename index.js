@@ -899,7 +899,7 @@ async function pinFailureResponse(req, schoolId, pin, studentId = null) {
   // 403, not 401: the apps treat 401 as "signed out".
   return { status: 403, body: { error: `Wrong PIN. ${result.triesLeft} ${result.triesLeft === 1 ? 'try' : 'tries'} left.`, code: 'PIN_WRONG', triesLeft: result.triesLeft } };
 }
-async function createQueueRequest(req, res, requestType, requiredStatus, nextStatus) {
+async function createQueueRequest(req, res, requestType, requiredStatuses, nextStatus) {
   const link = await guardianLinkQuery.get(req.params.studentId, req.user.id);
   if (!link) return res.status(403).json({ error: 'You are not linked to this student.' });
   if (requestType === 'PICK_UP' && !link.canPickUp) {
@@ -907,8 +907,8 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
   }
   const context = await studentContextQuery.get(req.params.studentId);
   if (!context) return res.status(404).json({ error: 'Student not found.' });
-  if (context.pickupStatus !== requiredStatus) {
-    return res.status(409).json({ error: `This student isn't currently ${requiredStatus === 'AT_HOME' ? 'at home' : 'present'}.` });
+  if (!requiredStatuses.includes(context.pickupStatus)) {
+    return res.status(409).json({ error: `This student isn't currently ${requestType === 'DROP_OFF' ? 'at home' : 'present'}.` });
   }
   if (context.campusStatus === 'SUSPENDED') {
     return res.status(409).json({ error: 'Drop-off and pick-up are paused at this school location right now. Please contact the school.' });
@@ -950,11 +950,13 @@ async function createQueueRequest(req, res, requestType, requiredStatus, nextSta
 }
 
 app.post('/api/me/students/:studentId/drop-off', requireAuth, requireRole('parent'), audited('DROPOFF_REQUESTED', req => ({ targetType: 'student', targetId: req.params.studentId, details: null })), asyncRoute(async (req, res) => {
-  await createQueueRequest(req, res, 'DROP_OFF', 'AT_HOME', 'DROPOFF_REQUESTED');
+  // PICKED_UP counts as at home: nothing resets a student after a pickup,
+  // so the next drop-off (usually the next morning) starts from there.
+  await createQueueRequest(req, res, 'DROP_OFF', ['AT_HOME', 'PICKED_UP'], 'DROPOFF_REQUESTED');
 }));
 
 app.post('/api/me/students/:studentId/pick-up', requireAuth, requireRole('parent'), audited('PICKUP_REQUESTED', req => ({ targetType: 'student', targetId: req.params.studentId, details: null })), asyncRoute(async (req, res) => {
-  await createQueueRequest(req, res, 'PICK_UP', 'PRESENT', 'PICKUP_REQUESTED');
+  await createQueueRequest(req, res, 'PICK_UP', ['PRESENT'], 'PICKUP_REQUESTED');
 }));
 
 const queueSelect = `
