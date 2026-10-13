@@ -908,7 +908,7 @@ async function createQueueRequest(req, res, requestType, requiredStatuses, nextS
   const context = await studentContextQuery.get(req.params.studentId);
   if (!context) return res.status(404).json({ error: 'Student not found.' });
   if (!requiredStatuses.includes(context.pickupStatus)) {
-    return res.status(409).json({ error: `This student isn't currently ${requestType === 'DROP_OFF' ? 'at home' : 'present'}.` });
+    return res.status(409).json({ error: `This student isn't currently ${requestType === 'DROP_OFF' ? 'at home' : 'at school'}.` });
   }
   if (context.campusStatus === 'SUSPENDED') {
     return res.status(409).json({ error: 'Drop-off and pick-up are paused at this school location right now. Please contact the school.' });
@@ -950,8 +950,8 @@ async function createQueueRequest(req, res, requestType, requiredStatuses, nextS
 }
 
 app.post('/api/me/students/:studentId/drop-off', requireAuth, requireRole('parent'), audited('DROPOFF_REQUESTED', req => ({ targetType: 'student', targetId: req.params.studentId, details: null })), asyncRoute(async (req, res) => {
-  // PICKED_UP counts as at home: nothing resets a student after a pickup,
-  // so the next drop-off (usually the next morning) starts from there.
+  // An approved pickup puts the student back AT_HOME. PICKED_UP is the
+  // old name for that state and is still accepted here.
   await createQueueRequest(req, res, 'DROP_OFF', ['AT_HOME', 'PICKED_UP'], 'DROPOFF_REQUESTED');
 }));
 
@@ -1005,7 +1005,7 @@ app.post('/api/queue/:id/approve', requireAuth, audited('QUEUE_REQUEST_ACCEPTED'
       const claimed = await db.prepare(`UPDATE queue_items SET status='APPROVED', approved_at=${NOW_UTC}, approved_by_user_id=? WHERE id=? AND status='PENDING'`)
         .run(req.user.id, item.id);
       if (claimed.changes === 0) throw new Error('This request was already handled.');
-      await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'PRESENT' : 'PICKED_UP', item.student_id);
+      await db.prepare('UPDATE students SET pickup_status=? WHERE id=?').run(item.request_type === 'DROP_OFF' ? 'PRESENT' : 'AT_HOME', item.student_id);
       // Accepting a drop-off also marks today's attendance PRESENT, so
       // the teacher doesn't have to separately mark it by hand on the
       // Class Roster — a checked-in student is a present student. If

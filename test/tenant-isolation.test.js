@@ -415,10 +415,10 @@ test('a pickup needs the parent\'s own 6-digit PIN, created the first time; a dr
   const otherTeacher = await login('teacher@school.test', 'password');
   assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, otherTeacher.token)).status, 403);
   assert.equal((await apiCall('POST', `/queue/${queueId}/approve`, teacher.token)).status, 204);
-  assert.equal((await db.prepare(`SELECT pickup_status FROM students WHERE id='child-3'`).get()).pickup_status, 'PICKED_UP');
+  assert.equal((await db.prepare(`SELECT pickup_status FROM students WHERE id='child-3'`).get()).pickup_status, 'AT_HOME', 'picked up means back at home');
 
-  // Drop-off needs no PIN, and a picked-up student can be dropped off again
-  // (the next morning) and then picked up again; a second pickup in a row is refused.
+  // Drop-off needs no PIN, and a picked-up student (at home again) can be
+  // dropped off the next morning; a second pickup in a row is refused.
   assert.equal((await apiCall('POST', '/me/students/child-3/pick-up', parent.token, { ...here, pin: MORGAN_PIN })).status, 409);
   const dropOff = await apiCall('POST', '/me/students/child-3/drop-off', parent.token, here);
   assert.equal(dropOff.status, 201);

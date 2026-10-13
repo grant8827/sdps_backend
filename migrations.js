@@ -955,6 +955,13 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 37,
+    name: 'a picked-up student is at home again (PICKED_UP was never reset, which blocked the next drop-off)',
+    async up(db) {
+      await db.exec(`UPDATE students SET pickup_status='AT_HOME' WHERE pickup_status='PICKED_UP'`);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {
