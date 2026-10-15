@@ -461,7 +461,9 @@ app.post('/api/me/mfa/confirm', requireAuth, asyncRoute(async (req, res) => {
   const user = await userWithMfa(req.user.id);
   if (user.mfa_enabled_at) return res.status(409).json({ error: 'Two-step verification is already on.' });
   const recoveryCodes = await finishEnrollment(user, req.body.code);
-  if (!recoveryCodes) return res.status(401).json({ error: "That code didn't work. Check the time on your phone and try the newest code." });
+  // 403, not 401: the person IS signed in. The apps treat a 401 as "your session ended" and sign them out,
+  // which is wrong for a mistyped code or password (same for the three checks below and in change-password).
+  if (!recoveryCodes) return res.status(403).json({ error: "That code didn't work. Check the time on your phone and try the newest code." });
   await auditForUser(user, 'MFA_ENABLED', req.ip);
   res.json({ recoveryCodes });
 }));
@@ -469,7 +471,7 @@ app.post('/api/me/mfa/confirm', requireAuth, asyncRoute(async (req, res) => {
 app.post('/api/me/mfa/recovery-codes', requireAuth, asyncRoute(async (req, res) => {
   const user = await userWithMfa(req.user.id);
   if (!user.mfa_enabled_at) return res.status(409).json({ error: 'Two-step verification is off.' });
-  if (await checkSecondFactor(user, req.body.code) !== 'AUTHENTICATOR') return res.status(401).json({ error: 'Enter the current code from your authenticator app.' });
+  if (await checkSecondFactor(user, req.body.code) !== 'AUTHENTICATOR') return res.status(403).json({ error: 'Enter the current code from your authenticator app.' });
   const recoveryCodes = newRecoveryCodes();
   await replaceRecoveryCodes(user.id, recoveryCodes);
   await auditForUser(user, 'MFA_RECOVERY_CODES_REPLACED', req.ip);
@@ -479,7 +481,7 @@ app.post('/api/me/mfa/recovery-codes', requireAuth, asyncRoute(async (req, res) 
 app.post('/api/me/mfa/disable', requireAuth, asyncRoute(async (req, res) => {
   const user = await userWithMfa(req.user.id);
   if (await mfaRequiredFor(user)) return res.status(403).json({ error: 'Two-step verification is required for your account and cannot be turned off.' });
-  if (!verifyPassword(String(req.body.password || ''), user.password_hash).ok) return res.status(401).json({ error: 'Password is incorrect.' });
+  if (!verifyPassword(String(req.body.password || ''), user.password_hash).ok) return res.status(403).json({ error: 'Password is incorrect.' });
   await withTransaction(async () => {
     await db.prepare('UPDATE users SET mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL WHERE id=?').run(user.id);
     await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(user.id);
@@ -651,7 +653,7 @@ app.post('/api/me/change-password', requireAuth, audited('PASSWORD_CHANGED', req
   if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
   const user = await db.prepare('SELECT password_hash FROM users WHERE id=?').get(req.user.id);
   if (!verifyPassword(currentPassword, user.password_hash).ok) {
-    return res.status(401).json({ error: 'Current password is incorrect' });
+    return res.status(403).json({ error: 'Current password is incorrect' });
   }
   await db.prepare('UPDATE users SET password_hash=?, needs_password_setup=0 WHERE id=?').run(passwordHash(newPassword), req.user.id);
   deliverLater(() => sendPasswordChangedEmail({ to: req.user.email, fullName: req.user.full_name }));
@@ -1751,23 +1753,56 @@ app.post('/api/admin/students/:studentId/guardians', requireAuth, requireSchoolA
 // Suspend blocks login (auth.js's login query requires active=1); delete
 // removes the user outright and cascades to their guardian row and any
 // student_guardians links (both declared ON DELETE CASCADE).
-app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_STATUS_CHANGED', req => ({ targetType: 'student', targetId: req.params.id, details: { status: req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE' } })), asyncRoute(async (req, res) => {
-  const status = req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
+app.patch('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_admin'), audited('STUDENT_UPDATED', req => ({ targetType: 'student', targetId: req.params.id, details: { fields: Object.keys(req.body).filter(key => key !== 'photoDataUrl') } })), asyncRoute(async (req, res) => {
+  const { firstName, lastName, dateOfBirth, studentNumber, photoDataUrl, schoolYearId, gradeLevelId, classId, daycare } = req.body;
+  const status = req.body.status === undefined ? undefined : req.body.status === 'SUSPENDED' ? 'SUSPENDED' : 'ACTIVE';
+  const editingDetails = [firstName, lastName, dateOfBirth, studentNumber, photoDataUrl, schoolYearId, gradeLevelId, classId, daycare].some(value => value !== undefined);
+  if (editingDetails && (!firstName?.trim() || !lastName?.trim() || !schoolYearId || !gradeLevelId || !classId)) {
+    return res.status(400).json({ error: 'Name, school year, grade, and class are required' });
+  }
+  let selectedClass;
+  if (editingDetails) {
+    selectedClass = await db.prepare('SELECT campus_id FROM classes WHERE id=? AND school_id=? AND school_year_id=? AND grade_level_id=?').get(classId, req.school.id, schoolYearId, gradeLevelId);
+    if (!selectedClass) return res.status(400).json({ error: 'The selected class, grade, or school year does not belong to this school' });
+    try { parseImageDataUrl(photoDataUrl); } catch (error) { return res.status(400).json({ error: error.message }); }
+  }
+  let newPhotoUrl;
   let result;
   try {
+    if (editingDetails && photoDataUrl !== undefined) newPhotoUrl = await storeImage(photoDataUrl, { schoolId: req.school.id, folder: 'students' });
     result = await withTransaction(async () => {
       // Reactivating a suspended student takes a place on the plan again.
       const student = await db.prepare(`SELECT first_name || ' ' || last_name AS name, status FROM students WHERE id=? AND school_id=? AND status<>'ARCHIVED' FOR UPDATE`).get(req.params.id, req.school.id);
       if (!student) return { changes: 0 };
       if (status === 'ACTIVE' && student.status !== 'ACTIVE') await assertRoomForStudent(req.school.id, student.name);
-      return db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
+      let changes = 0;
+      if (editingDetails) {
+        const current = await db.prepare('SELECT photo_url FROM students WHERE id=? AND school_id=?').get(req.params.id, req.school.id);
+        const photoUrl = photoDataUrl !== undefined ? newPhotoUrl : current.photo_url;
+        const updated = await db.prepare('UPDATE students SET first_name=?,last_name=?,date_of_birth=?,student_number=?,photo_url=?,daycare=?,campus_id=? WHERE id=? AND school_id=?')
+          .run(firstName.trim(), lastName.trim(), dateOfBirth || null, studentNumber?.trim() || null, photoUrl, daycare ? 1 : 0, selectedClass.campus_id, req.params.id, req.school.id);
+        await db.prepare('UPDATE student_enrollments SET school_year_id=?,grade_level_id=?,class_id=?,campus_id=? WHERE student_id=? AND school_id=?')
+          .run(schoolYearId, gradeLevelId, classId, selectedClass.campus_id, req.params.id, req.school.id);
+        if (photoDataUrl !== undefined) res.locals.previousStudentPhoto = current.photo_url;
+        changes = updated.changes;
+      }
+      if (status !== undefined) {
+        const updated = await db.prepare('UPDATE students SET status=? WHERE id=? AND school_id=?').run(status, req.params.id, req.school.id);
+        changes = Math.max(changes, updated.changes);
+      }
+      return { changes };
     });
   } catch (error) {
+    await removeStoredImage(newPhotoUrl);
     if (error instanceof StudentLimitError) return res.status(409).json(studentLimitResponse(error));
-    throw error;
+    return res.status(400).json({ error: isUniqueViolation(error) ? 'That student number is already in use' : error.message });
   }
   if (result.changes === 0) return res.status(404).json({ error: 'Student not found' });
-  await recordEnrollment(req.school.id, status === 'ACTIVE' ? 'Student reactivated' : 'Student suspended');
+  if (editingDetails && photoDataUrl !== undefined) {
+    newPhotoUrl = null;
+    await removeStoredImage(res.locals.previousStudentPhoto);
+  }
+  if (status !== undefined) await recordEnrollment(req.school.id, status === 'ACTIVE' ? 'Student reactivated' : 'Student suspended');
   res.status(204).end();
 }));
 

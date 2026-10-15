@@ -559,7 +559,7 @@ test('teachers can opt in to two-step verification and turn it off with their pa
   assert.equal(recoveryCodes.length, 10);
   assert.equal((await login('mfa-teacher@test.local', 'password')).mfaRequired, true);
 
-  assert.equal((await apiCall('POST', '/me/mfa/disable', token, { password: 'wrong' })).status, 401);
+  assert.equal((await apiCall('POST', '/me/mfa/disable', token, { password: 'wrong' })).status, 403, 'a wrong password is refused without ending the session');
   assert.equal((await apiCall('POST', '/me/mfa/disable', token, { password: 'password' })).status, 204);
   assert.ok((await login('mfa-teacher@test.local', 'password')).token);
 });
@@ -2357,4 +2357,16 @@ test('sign-up flow: a public price list, and a new school chooses its trial plan
     for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
     await new Promise(resolve => fake.close(resolve));
   }
+});
+
+test('a mistyped current password or code is refused without signing the person out', async () => {
+  const parent = await login('morgan@school.test', 'password');
+  const wrong = await apiCall('POST', '/me/change-password', parent.token, { currentPassword: 'not-my-password', newPassword: 'new-password-1' });
+  assert.equal(wrong.status, 403, 'the apps treat 401 as "signed out"');
+  assert.match((await wrong.json()).error, /Current password is incorrect/);
+  assert.equal((await apiCall('POST', '/me/mfa/confirm', parent.token, { code: '000000' })).status !== 401, true);
+  assert.equal((await apiCall('POST', '/me/mfa/recovery-codes', parent.token, { code: '000000' })).status !== 401, true);
+  assert.equal((await apiCall('GET', '/me/students', parent.token)).status, 200, 'still signed in');
+  // No token at all is still a 401.
+  assert.equal((await apiCall('POST', '/me/change-password', null, { currentPassword: 'x', newPassword: 'new-password-1' })).status, 401);
 });
