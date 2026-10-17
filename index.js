@@ -114,7 +114,7 @@ function localClockTime(timeZone) {
 // app). OpenStreetMap's Nominatim is free and needs no API key/billing —
 // a descriptive User-Agent is required by their usage policy. Isolated
 // in one function so swapping to a paid provider later is a one-place change.
-const NOMINATIM_USER_AGENT = 'school-dropoff-pickup/1.0 (admin-configured campus geocoding)';
+const NOMINATIM_USER_AGENT = 'sdpmplus/1.0 (admin-configured campus geocoding)';
 
 function parseAddressFields(address) {
   const fields = { addressLine1: '', addressLine2: '', city: '', state: '', postalCode: '', country: '' };
@@ -802,7 +802,7 @@ app.get('/api/me/students', requireAuth, requireRole('parent'), asyncRoute(async
 // window it needs (e.g. the current Mon-Fri) from the full list.
 app.get('/api/me/attendance', requireAuth, requireRole('parent'), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
-    SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName", c.name AS "className", u.full_name AS "teacherName",
+    SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl", c.name AS "className", u.full_name AS "teacherName",
       ar.date, ar.status, ar.late
     FROM students s
     JOIN student_guardians sg ON sg.student_id=s.id
@@ -819,7 +819,7 @@ app.get('/api/me/attendance', requireAuth, requireRole('parent'), asyncRoute(asy
   const byStudent = new Map();
   for (const row of rows) {
     if (!byStudent.has(row.studentId)) {
-      byStudent.set(row.studentId, { id: row.studentId, fullName: row.fullName, className: row.className, teacherName: row.teacherName, records: [] });
+      byStudent.set(row.studentId, { id: row.studentId, fullName: row.fullName, photoUrl: row.photoUrl, className: row.className, teacherName: row.teacherName, records: [] });
     }
     if (row.date) byStudent.get(row.studentId).records.push({ date: row.date, status: row.status, late: Boolean(row.late) });
   }
@@ -1124,7 +1124,7 @@ app.get('/api/teacher/students', requireAuth, requireRole('teacher'), audited('C
 // class instead of just a parent's own children.
 app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), audited('ATTENDANCE_HISTORY_VIEWED', (req, body) => ({ details: { studentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   const rows = await db.prepare(`
-    SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName",
+    SELECT s.id AS "studentId", s.first_name || ' ' || s.last_name AS "fullName", s.photo_url AS "photoUrl",
       ar.date, ar.status, ar.late
     FROM students s
     JOIN student_enrollments e ON e.student_id=s.id
@@ -1137,7 +1137,7 @@ app.get('/api/teacher/attendance-history', requireAuth, requireRole('teacher'), 
   const byStudent = new Map();
   for (const row of rows) {
     if (!byStudent.has(row.studentId)) {
-      byStudent.set(row.studentId, { id: row.studentId, fullName: row.fullName, records: [] });
+      byStudent.set(row.studentId, { id: row.studentId, fullName: row.fullName, photoUrl: row.photoUrl, records: [] });
     }
     if (row.date) byStudent.get(row.studentId).records.push({ date: row.date, status: row.status, late: Boolean(row.late) });
   }

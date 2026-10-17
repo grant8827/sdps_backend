@@ -8,7 +8,7 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, 
 
 const STEP_SECONDS = 30;
 const DIGITS = 6;
-const ISSUER = 'School Drop-off & Pick-up';
+const ISSUER = 'SDPMPlus';
 
 // ---- Secret storage -------------------------------------------------
 // The per-user TOTP secret is stored encrypted (AES-256-GCM) with a key
