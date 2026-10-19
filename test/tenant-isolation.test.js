@@ -2370,3 +2370,38 @@ test('a mistyped current password or code is refused without signing the person 
   // No token at all is still a 401.
   assert.equal((await apiCall('POST', '/me/change-password', null, { currentPassword: 'x', newPassword: 'new-password-1' })).status, 401);
 });
+
+test('classes upgrade: within this year students move at once; next year is created on request and waits', async () => {
+  const admin = await login('admin@school.test', 'password');
+  // Next school year: the one already planned is returned rather than a second one.
+  const next = await apiCall('POST', '/admin/school-years/next', admin.token);
+  assert.equal(next.status, 200);
+  assert.deepEqual(await next.json(), { id: 'year-next', name: '2027-2028', created: false });
+
+  await addSchoolUser('teacher-upgrade', 'teacher', 'teacher');
+  const addClass = async (name, gradeLevelId, schoolYearId) => (await (await apiCall('POST', '/admin/classes', admin.token, { name, gradeLevelId, schoolYearId })).json()).id;
+  const fromClass = await addClass('Upgrade From', 'grade-2', 'year-current');
+  const toClass = await addClass('Upgrade To', 'grade-3', 'year-current');
+  const nextYearClass = await addClass('Upgrade Next Year', 'grade-3', 'year-next');
+  await db.prepare(`UPDATE classes SET teacher_user_id='teacher-upgrade' WHERE id=?`).run(nextYearClass);
+  await db.prepare(`INSERT INTO students (id,first_name,last_name,school_id) VALUES ('student-upgrade','Una','Upgrade','school-default')`).run();
+  await db.prepare(`INSERT INTO student_enrollments (id,student_id,school_year_id,grade_level_id,class_id,school_id) VALUES ('enrollment-upgrade','student-upgrade','year-current','grade-2',?,'school-default')`).run(fromClass);
+  await db.prepare(`INSERT INTO queue_items (id,school_id,student_id,teacher_user_id,request_type,requested_by_user_id) VALUES ('queue-upgrade','school-default','student-upgrade',NULL,'PICK_UP','parent-1')`).run();
+
+  assert.equal((await apiCall('POST', '/admin/promotions/by-class', admin.token, { fromClassId: fromClass, toClassId: fromClass })).status, 400);
+
+  const moved = await apiCall('POST', '/admin/promotions/by-class', admin.token, { fromClassId: fromClass, toClassId: toClass, teacherUserId: 'teacher-upgrade' });
+  assert.equal(moved.status, 200);
+  assert.deepEqual(await moved.json(), { promoted: 1, skipped: 0, sameYear: true });
+  const enrollment = await db.prepare(`SELECT class_id, grade_level_id FROM student_enrollments WHERE student_id='student-upgrade'`).all();
+  assert.deepEqual(enrollment, [{ class_id: toClass, grade_level_id: 'grade-3' }], 'moved, not copied');
+  assert.equal((await db.prepare(`SELECT teacher_user_id FROM classes WHERE id=?`).get(toClass)).teacher_user_id, 'teacher-upgrade');
+  assert.equal((await db.prepare(`SELECT teacher_user_id FROM classes WHERE id=?`).get(nextYearClass)).teacher_user_id, 'teacher-upgrade', "next year's class keeps its teacher");
+  assert.equal((await db.prepare(`SELECT teacher_user_id FROM queue_items WHERE id='queue-upgrade'`).get()).teacher_user_id, 'teacher-upgrade', 'a waiting request goes to the new teacher');
+
+  // The teacher list shows each teacher once, with this year's class.
+  const teachers = await (await apiCall('GET', '/admin/teachers', admin.token)).json();
+  const rows = teachers.filter(t => t.id === 'teacher-upgrade');
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].classId, toClass);
+});

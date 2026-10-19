@@ -1437,8 +1437,9 @@ app.get('/api/admin/teachers', requireAuth, requireSchoolAccess('school_admin', 
     FROM memberships m
     JOIN users u ON u.id=m.user_id
     LEFT JOIN classes c ON c.teacher_user_id=u.id AND c.school_id=?
+      AND c.school_year_id IN (SELECT id FROM school_years WHERE school_id=? AND status='ACTIVE')
     WHERE m.school_id=? AND m.role='teacher'
-    ORDER BY u.full_name`).all(req.school.id, req.school.id);
+    ORDER BY u.full_name`).all(req.school.id, req.school.id, req.school.id);
   res.json(rows.map(r => ({ ...r, active: r.status === 'ACTIVE' })));
 }));
 
@@ -1500,12 +1501,14 @@ app.patch('/api/admin/teachers/:id', requireAuth, requireSchoolAccess('school_ad
     await removeStoredImage(previous);
   }
   if (classId !== undefined) {
-    await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=?`).run(req.params.id, req.school.id);
-    if (classId) {
-      const cls = await db.prepare('SELECT id FROM classes WHERE id=? AND school_id=?').get(classId, req.school.id);
-      if (!cls) return res.status(400).json({ error: 'That classroom does not belong to this school' });
-      await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(req.params.id, classId);
-    }
+    // One classroom per teacher per school year: this replaces their class
+    // in the chosen class's year (this year when clearing it), and leaves
+    // a class already planned for another year alone.
+    const cls = classId ? await db.prepare('SELECT id, school_year_id AS "schoolYearId" FROM classes WHERE id=? AND school_id=?').get(classId, req.school.id) : null;
+    if (classId && !cls) return res.status(400).json({ error: 'That classroom does not belong to this school' });
+    const yearId = cls?.schoolYearId ?? (await db.prepare(`SELECT id FROM school_years WHERE school_id=? AND status='ACTIVE'`).get(req.school.id))?.id ?? null;
+    await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=? AND (?::text IS NULL OR school_year_id=?)`).run(req.params.id, req.school.id, yearId, yearId);
+    if (cls) await db.prepare('UPDATE classes SET teacher_user_id=? WHERE id=?').run(req.params.id, classId);
   }
   res.status(204).end();
 }));
@@ -1952,22 +1955,40 @@ app.post('/api/admin/promotions/by-grade', requireAuth, requireSchoolAccess('sch
 app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('school_admin'), audited('PROMOTION_RUN', (req, body) => ({ details: { type: 'by-class', ...req.body, promoted: body?.promoted, skipped: body?.skipped } })), asyncRoute(async (req, res) => {
   const { fromClassId, toClassId, teacherUserId } = req.body;
   if (!fromClassId || !toClassId) return res.status(400).json({ error: 'fromClassId and toClassId are required' });
+  if (fromClassId === toClassId) return res.status(400).json({ error: 'Choose a different class to move the students into.' });
   const fromClass = await db.prepare('SELECT id, school_year_id AS "schoolYearId" FROM classes WHERE id=? AND school_id=?').get(fromClassId, req.school.id);
   const toClass = await db.prepare('SELECT id, school_year_id AS "schoolYearId", grade_level_id AS "gradeLevelId" FROM classes WHERE id=? AND school_id=?').get(toClassId, req.school.id);
   if (!fromClass || !toClass) return res.status(400).json({ error: 'Invalid class selection' });
   if (teacherUserId) {
-    const validTeacher = await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role='teacher'`).get(teacherUserId, req.school.id);
+    const validTeacher = await db.prepare(`SELECT 1 FROM memberships WHERE user_id=? AND school_id=? AND role='teacher' AND status='ACTIVE'`).get(teacherUserId, req.school.id);
     if (!validTeacher) return res.status(400).json({ error: 'Invalid teacher selection' });
   }
   try {
-    const { promoted, skipped } = await withTransaction(async () => {
+    const { promoted, skipped, sameYear } = await withTransaction(async () => {
       if (teacherUserId) {
-        // Same reassignment pattern as PATCH /api/admin/teachers/:id — a
-        // teacher owns at most one classroom, so picking a teacher here
-        // (e.g. because the destination class has none yet) moves them
-        // off whatever class they had onto this one.
-        await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=?`).run(teacherUserId, req.school.id);
+        // A teacher has at most one classroom per school year, so picking
+        // a teacher here moves them off their other class in the SAME year
+        // (the destination's). Assigning someone to next year's class
+        // leaves this year's class, and its queue, as it is.
+        await db.prepare(`UPDATE classes SET teacher_user_id=NULL WHERE teacher_user_id=? AND school_id=? AND school_year_id=?`).run(teacherUserId, req.school.id, toClass.schoolYearId);
         await db.prepare(`UPDATE classes SET teacher_user_id=? WHERE id=?`).run(teacherUserId, toClassId);
+      }
+      if (fromClass.schoolYearId === toClass.schoolYearId) {
+        // Within the same school year the students MOVE: their enrollment
+        // for this year now points at the new class and grade, which
+        // parents and teachers see straight away. Requests still waiting
+        // go to the new class's teacher.
+        const moved = await db.prepare(`
+          UPDATE student_enrollments e SET class_id=?, grade_level_id=?
+          FROM students s
+          WHERE s.id=e.student_id AND e.class_id=? AND e.school_year_id=? AND e.school_id=? AND e.status='ENROLLED' AND s.status='ACTIVE'
+          RETURNING e.student_id`).all(toClassId, toClass.gradeLevelId, fromClassId, fromClass.schoolYearId, req.school.id);
+        const newTeacher = (await db.prepare('SELECT teacher_user_id AS "teacherId" FROM classes WHERE id=?').get(toClassId))?.teacherId ?? null;
+        if (moved.length > 0) {
+          await db.prepare(`UPDATE queue_items SET teacher_user_id=? WHERE status='PENDING' AND school_id=? AND student_id = ANY(?)`)
+            .run(newTeacher, req.school.id, moved.map(row => row.student_id));
+        }
+        return { promoted: moved.length, skipped: 0, sameYear: true };
       }
       const enrollments = await db.prepare(`
         SELECT e.id, e.student_id, e.campus_id FROM student_enrollments e
@@ -1982,12 +2003,36 @@ app.post('/api/admin/promotions/by-class', requireAuth, requireSchoolAccess('sch
         await insert.run(id('enrollment'), enrollment.student_id, toClass.schoolYearId, toClass.gradeLevelId, toClassId, enrollment.id, req.school.id, enrollment.campus_id);
         promoted++;
       }
-      return { promoted, skipped };
+      return { promoted, skipped, sameYear: false };
     });
-    res.json({ promoted, skipped });
+    res.json({ promoted, skipped, sameYear });
   } catch (error) {
     res.status(400).json({ error: error.message });
   }
+}));
+
+// Creates next school year (PLANNING) after the current one, so classes
+// can be set up and students upgraded into it before it starts. Named and
+// dated one year on ("2026-2027" -> "2027-2028"). Only one year can be in
+// planning at a time; asking again returns that one.
+app.post('/api/admin/school-years/next', requireAuth, requireSchoolAccess('school_admin'), audited('SCHOOL_YEAR_CREATED', (req, body) => ({ targetType: 'school_year', targetId: body?.id, details: { name: body?.name } })), asyncRoute(async (req, res) => {
+  const planning = await db.prepare(`SELECT id, name FROM school_years WHERE school_id=? AND status='PLANNING' ORDER BY starts_on LIMIT 1`).get(req.school.id);
+  if (planning) return res.json({ ...planning, created: false });
+  const current = await db.prepare(`SELECT name, starts_on AS "startsOn", ends_on AS "endsOn" FROM school_years WHERE school_id=? AND status='ACTIVE'`).get(req.school.id);
+  if (!current) return res.status(400).json({ error: 'There is no current school year to follow.' });
+  const plusYear = date => (date ? `${Number(String(date).slice(0, 4)) + 1}${String(date).slice(4)}` : null);
+  const match = /^(\d{4})\s*[-/]\s*(\d{4})$/.exec(current.name.trim());
+  const startYear = match ? Number(match[1]) + 1 : Number(String(current.startsOn ?? new Date().getFullYear()).slice(0, 4)) + 1;
+  const name = match ? `${startYear}-${Number(match[2]) + 1}` : `${startYear}-${startYear + 1}`;
+  const yearId = id('year');
+  try {
+    await db.prepare(`INSERT INTO school_years (id,school_id,name,starts_on,ends_on,status) VALUES (?,?,?,?,?,'PLANNING')`)
+      .run(yearId, req.school.id, name, plusYear(current.startsOn) ?? `${startYear}-08-01`, plusYear(current.endsOn) ?? `${startYear + 1}-06-30`);
+  } catch (error) {
+    if (isUniqueViolation(error)) return res.status(409).json({ error: `A school year named ${name} already exists.` });
+    throw error;
+  }
+  res.status(201).json({ id: yearId, name, created: true });
 }));
 
 // Flips a PLANNING year to ACTIVE (and closes whatever year was ACTIVE
