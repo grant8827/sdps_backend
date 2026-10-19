@@ -1261,6 +1261,68 @@ app.patch('/api/admin/school', requireAuth, requireSchoolAccess('school_admin'),
 // The school's own Subscription page (schoolBilling.js).
 registerSchoolBilling(app);
 
+// Deleting the school: its administrator asks from their Profile, and
+// the request joins the platform's Compliance → Data Requests queue (due
+// in 30 days, approved by a second person, blocked by a legal hold),
+// where the platform team carries it out. Until then the school keeps
+// working, so it can export its data, and the administrator can withdraw
+// the request while it is still being reviewed.
+const OPEN_SCHOOL_DELETION = `
+  SELECT id, status, created_at AS "createdAt", due_at AS "dueAt", requester_name AS "requesterName"
+  FROM data_requests WHERE school_id=? AND kind='DELETION' AND subject_type='SCHOOL' AND status NOT IN ('COMPLETED','REJECTED')
+  ORDER BY created_at DESC LIMIT 1`;
+const WITHDRAWABLE = ['REQUESTED', 'UNDER_REVIEW'];
+const utcStamp = (offsetDays = 0) => new Date(Date.now() + offsetDays * 86400000).toISOString().replace('T', ' ').slice(0, 19);
+
+app.get('/api/admin/school/deletion-request', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  const request = await db.prepare(OPEN_SCHOOL_DELETION).get(req.school.id);
+  res.json({ request: request ? { ...request, canWithdraw: WITHDRAWABLE.includes(request.status) } : null });
+}));
+
+app.post('/api/admin/school/deletion-request', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  if (req.membership.support) return res.status(403).json({ error: "Only the school's own administrator can ask for the school to be deleted." });
+  const school = await db.prepare('SELECT name FROM schools WHERE id=?').get(req.school.id);
+  const typed = String(req.body?.confirmName ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!school || typed !== school.name.replace(/\s+/g, ' ').trim().toLowerCase()) {
+    return res.status(400).json({ error: "Type the school's name exactly as shown to confirm." });
+  }
+  const user = await db.prepare('SELECT password_hash FROM users WHERE id=?').get(req.user.id);
+  // 403, not 401: the apps treat 401 as "signed out".
+  if (!user || !verifyPassword(String(req.body?.password ?? ''), user.password_hash).ok) return res.status(403).json({ error: 'Password is incorrect.' });
+  if (await db.prepare(OPEN_SCHOOL_DELETION).get(req.school.id)) return res.status(409).json({ error: 'A request to delete this school is already open.' });
+  const requestId = id('datarequest');
+  const receivedVia = 'School administrator, from their Profile';
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 2000) : '';
+  await db.prepare(`
+    INSERT INTO data_requests (id,school_id,kind,subject_type,subject_id,subject_label,requester_name,requester_relationship,received_via,details,due_at,created_by_user_id)
+    VALUES (?,?,'DELETION','SCHOOL',?,?,?,?,?,?,?,?)`)
+    .run(requestId, req.school.id, req.school.id, `Whole school: ${school.name}`, req.user.full_name, 'School administrator', receivedVia, reason || null, utcStamp(30), req.user.id);
+  await writeAudit({
+    schoolId: req.school.id, actor: req.user, actorRole: req.membership.role, action: 'DATA_DELETION_REQUESTED',
+    targetType: 'data_request', targetId: requestId, targetLabel: `DELETION · Whole school: ${school.name}`,
+    details: { subjectType: 'SCHOOL', requester: req.user.full_name, receivedVia }, ip: req.ip, requestId: req.requestId,
+  });
+  const request = await db.prepare(OPEN_SCHOOL_DELETION).get(req.school.id);
+  res.status(201).json({ request: { ...request, canWithdraw: true } });
+}));
+
+app.post('/api/admin/school/deletion-request/withdraw', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  if (req.membership.support) return res.status(403).json({ error: "Only the school's own administrator can withdraw this request." });
+  const request = await db.prepare(OPEN_SCHOOL_DELETION).get(req.school.id);
+  if (!request) return res.status(404).json({ error: 'There is no open request to delete this school.' });
+  if (!WITHDRAWABLE.includes(request.status)) {
+    return res.status(409).json({ error: 'This request has already been approved, so it can no longer be withdrawn here. Please contact SDPMPlus support.' });
+  }
+  const now = utcStamp();
+  await db.prepare(`UPDATE data_requests SET status='REJECTED', status_note=?, updated_at=?, completed_at=? WHERE id=? AND status=?`)
+    .run(`Withdrawn by ${req.user.full_name} (school administrator).`, now, now, request.id, request.status);
+  await writeAudit({
+    schoolId: req.school.id, actor: req.user, actorRole: req.membership.role, action: 'DATA_REQUEST_WITHDRAWN',
+    targetType: 'data_request', targetId: request.id, targetLabel: 'DELETION · Whole school', ip: req.ip, requestId: req.requestId,
+  });
+  res.status(204).end();
+}));
+
 // The school's name and logo, shown at the top of every signed-in
 // person's dashboard (parents, teachers, front desk, administrators).
 app.get('/api/me/school', requireAuth, requireSchoolAccess(), asyncRoute(async (req, res) => {

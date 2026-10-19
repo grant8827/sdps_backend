@@ -2405,3 +2405,29 @@ test('classes upgrade: within this year students move at once; next year is crea
   assert.equal(rows.length, 1);
   assert.equal(rows[0].classId, toClass);
 });
+
+test("a school administrator can ask for the school to be deleted, and withdraw it while it's being reviewed", async () => {
+  const admin = await login('admin@school.test', 'password');
+  const teacher = await login('teacher@school.test', 'password');
+  const schoolName = (await db.prepare(`SELECT name FROM schools WHERE id='school-default'`).get()).name;
+  assert.deepEqual(await (await apiCall('GET', '/admin/school/deletion-request', admin.token)).json(), { request: null });
+  assert.equal((await apiCall('POST', '/admin/school/deletion-request', teacher.token, { confirmName: schoolName, password: 'password' })).status, 403);
+  assert.equal((await apiCall('POST', '/admin/school/deletion-request', admin.token, { confirmName: 'Some Other School', password: 'password' })).status, 400);
+  assert.equal((await apiCall('POST', '/admin/school/deletion-request', admin.token, { confirmName: schoolName, password: 'wrong' })).status, 403);
+
+  const created = await apiCall('POST', '/admin/school/deletion-request', admin.token, { confirmName: ` ${schoolName.toUpperCase()} `, password: 'password' });
+  assert.equal(created.status, 201);
+  const { request } = await created.json();
+  assert.equal(request.status, 'REQUESTED');
+  // It is in the platform's queue as a whole-school deletion, logged by the admin.
+  const row = await db.prepare(`SELECT kind, subject_type, created_by_user_id FROM data_requests WHERE id=?`).get(request.id);
+  assert.deepEqual(row, { kind: 'DELETION', subject_type: 'SCHOOL', created_by_user_id: 'admin-1' });
+  assert.ok(await db.prepare(`SELECT 1 FROM audit_logs WHERE action='DATA_DELETION_REQUESTED' AND target_id=?`).get(request.id));
+  assert.equal((await apiCall('POST', '/admin/school/deletion-request', admin.token, { confirmName: schoolName, password: 'password' })).status, 409);
+
+  assert.equal((await apiCall('POST', '/admin/school/deletion-request/withdraw', admin.token)).status, 204);
+  assert.equal((await db.prepare(`SELECT status FROM data_requests WHERE id=?`).get(request.id)).status, 'REJECTED');
+  assert.deepEqual(await (await apiCall('GET', '/admin/school/deletion-request', admin.token)).json(), { request: null });
+  // Nothing was deleted: the school still works.
+  assert.equal((await apiCall('GET', '/me/school', admin.token)).status, 200);
+});
