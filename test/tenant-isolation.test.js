@@ -2431,3 +2431,25 @@ test("a school administrator can ask for the school to be deleted, and withdraw 
   // Nothing was deleted: the school still works.
   assert.equal((await apiCall('GET', '/me/school', admin.token)).status, 200);
 });
+
+test('a school administrator confirms reading the policies, and the platform sees who and when', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const teacher = await login('teacher@school.test', 'password');
+  const before = await (await apiCall('GET', '/admin/policies/acknowledgment', admin.token)).json();
+  assert.equal(before.acknowledgment, null);
+  const body = { version: 'privacy-policy:October 1, 2026', documents: [{ slug: 'privacy-policy', title: 'Privacy Policy', updated: 'October 1, 2026' }] };
+  assert.equal((await apiCall('POST', '/admin/policies/acknowledgment', teacher.token, body)).status, 403);
+  assert.equal((await apiCall('POST', '/admin/policies/acknowledgment', admin.token, { version: 'x', documents: [] })).status, 400);
+
+  const saved = await apiCall('POST', '/admin/policies/acknowledgment', admin.token, body);
+  assert.equal(saved.status, 201);
+  const { acknowledgment } = await (await apiCall('GET', '/admin/policies/acknowledgment', admin.token)).json();
+  assert.equal(acknowledgment.version, body.version);
+  assert.equal(acknowledgment.userName, 'Alex Admin');
+  assert.ok(await db.prepare(`SELECT 1 FROM audit_logs WHERE action='POLICIES_ACKNOWLEDGED' AND school_id='school-default'`).get());
+
+  const superAdmin = await login('super-1@test.local', 'password');
+  const school = await (await apiCall('GET', '/superadmin/schools/school-default', superAdmin.token)).json();
+  assert.equal(school.policyAcknowledgments[0].userName, 'Alex Admin');
+  assert.deepEqual(school.policyAcknowledgments[0].documents, body.documents);
+});

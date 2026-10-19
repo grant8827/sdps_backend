@@ -962,6 +962,27 @@ const migrations = [
       await db.exec(`UPDATE students SET pickup_status='AT_HOME' WHERE pickup_status='PICKED_UP'`);
     },
   },
+  {
+    version: 38,
+    name: "policy acknowledgments: a school administrator confirms they have read SDPMPlus's legal and policy documents",
+    async up(db) {
+      // One row per confirmation, kept for good: who, for which school,
+      // and which versions of the documents (each one's Last updated date).
+      await db.exec(`
+        CREATE TABLE IF NOT EXISTS policy_acknowledgments (
+          id TEXT PRIMARY KEY,
+          school_id TEXT NOT NULL REFERENCES schools(id),
+          user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+          user_name TEXT NOT NULL,
+          version TEXT NOT NULL,
+          documents TEXT NOT NULL,
+          ip_address TEXT,
+          acknowledged_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'utc', 'YYYY-MM-DD HH24:MI:SS')
+        );
+        CREATE INDEX IF NOT EXISTS policy_acknowledgments_school_idx ON policy_acknowledgments(school_id, acknowledged_at DESC);
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

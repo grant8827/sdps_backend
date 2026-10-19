@@ -157,7 +157,12 @@ superadmin.get('/schools/:id', requirePlatformPermission('school:view'), asyncRo
     { key: 'students', label: 'Has students', done: schoolCountsRow.students > 0 },
   ];
   await audit(req, { schoolId: school.id, action: 'PLATFORM_SCHOOL_VIEWED', targetType: 'school', targetId: school.id, targetLabel: school.name });
-  res.json({ ...school, counts: schoolCountsRow, locations, admins, activeYear: activeYear ?? null, setup });
+  // Every time an administrator confirmed reading the legal and policy documents, newest first.
+  const policyAcknowledgments = (await db.prepare(`
+    SELECT id, user_name AS "userName", documents, acknowledged_at AS "acknowledgedAt"
+    FROM policy_acknowledgments WHERE school_id=? ORDER BY acknowledged_at DESC, id DESC LIMIT 20`).all(req.params.id))
+    .map(row => ({ ...row, documents: JSON.parse(row.documents) }));
+  res.json({ ...school, counts: schoolCountsRow, locations, admins, activeYear: activeYear ?? null, setup, policyAcknowledgments });
 }));
 
 const codeFromSchoolName = name => name.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8) || 'SCHOOL';

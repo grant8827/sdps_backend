@@ -1323,6 +1323,37 @@ app.post('/api/admin/school/deletion-request/withdraw', requireAuth, requireScho
   res.status(204).end();
 }));
 
+// Legal & Policies: a school administrator confirms they have read
+// SDPMPlus's legal and policy documents. The dashboard keeps asking until
+// the current versions are confirmed (a document's Last updated date
+// changing asks again), and the platform sees each confirmation on the
+// school's page.
+const LATEST_POLICY_ACK = `
+  SELECT version, user_name AS "userName", acknowledged_at AS "acknowledgedAt"
+  FROM policy_acknowledgments WHERE school_id=? ORDER BY acknowledged_at DESC, id DESC LIMIT 1`;
+
+app.get('/api/admin/policies/acknowledgment', requireAuth, requireSchoolAccess('school_admin', 'staff'), asyncRoute(async (req, res) => {
+  res.json({ acknowledgment: (await db.prepare(LATEST_POLICY_ACK).get(req.school.id)) ?? null });
+}));
+
+app.post('/api/admin/policies/acknowledgment', requireAuth, requireSchoolAccess('school_admin'), asyncRoute(async (req, res) => {
+  if (req.membership.support) return res.status(403).json({ error: "Only the school's own administrator can confirm this." });
+  const version = typeof req.body?.version === 'string' ? req.body.version.trim().slice(0, 2000) : '';
+  const documents = Array.isArray(req.body?.documents) ? req.body.documents.slice(0, 50)
+    .filter(doc => doc && typeof doc.slug === 'string' && typeof doc.title === 'string')
+    .map(doc => ({ slug: doc.slug.slice(0, 80), title: doc.title.slice(0, 120), updated: typeof doc.updated === 'string' ? doc.updated.slice(0, 40) : null })) : [];
+  if (!version || documents.length === 0) return res.status(400).json({ error: 'The documents being confirmed are missing.' });
+  const ackId = id('policyack');
+  await db.prepare('INSERT INTO policy_acknowledgments (id,school_id,user_id,user_name,version,documents,ip_address) VALUES (?,?,?,?,?,?,?)')
+    .run(ackId, req.school.id, req.user.id, req.user.full_name, version, JSON.stringify(documents), req.ip ?? null);
+  await writeAudit({
+    schoolId: req.school.id, actor: req.user, actorRole: req.membership.role, action: 'POLICIES_ACKNOWLEDGED',
+    targetType: 'school', targetId: req.school.id, details: { documents: documents.map(doc => `${doc.title} (${doc.updated ?? 'no date'})`) },
+    ip: req.ip, requestId: req.requestId,
+  });
+  res.status(201).json({ acknowledgment: await db.prepare(LATEST_POLICY_ACK).get(req.school.id) });
+}));
+
 // The school's name and logo, shown at the top of every signed-in
 // person's dashboard (parents, teachers, front desk, administrators).
 app.get('/api/me/school', requireAuth, requireSchoolAccess(), asyncRoute(async (req, res) => {
