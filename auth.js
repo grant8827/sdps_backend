@@ -32,11 +32,17 @@ const hasActiveMembership = { get: canSignIn };
 // platform admins; optional for teachers and parents, who can turn it
 // on themselves. REQUIRE_ADMIN_MFA=false switches the requirement off
 // (local development/tests only); it never turns off MFA for someone
-// who has already enabled it.
+// who has already enabled it. MFA_EXEMPT_EMAILS (comma-separated) lets
+// named school-admin accounts — the app store review account — sign in
+// with just a password; platform admins are never exempt.
+export const mfaExemptEmails = () => (process.env.MFA_EXEMPT_EMAILS ?? '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+
 export async function mfaRequiredFor(user) {
   if (process.env.REQUIRE_ADMIN_MFA === 'false') return false;
-  if (user.role === 'admin') return true;
-  return Boolean(await getPlatformAdmin(user.id));
+  const platformAdmin = Boolean(await getPlatformAdmin(user.id));
+  if (platformAdmin) return true;
+  if (user.role !== 'admin') return false;
+  return !(user.email && mfaExemptEmails().includes(user.email.toLowerCase()));
 }
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;

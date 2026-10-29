@@ -983,6 +983,16 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 39,
+    name: 'data requests: an account holder asks for their own account to be deleted (public /delete-account page)',
+    async up(db) {
+      await db.exec(`
+        ALTER TABLE data_requests DROP CONSTRAINT IF EXISTS data_requests_subject_type_check;
+        ALTER TABLE data_requests ADD CONSTRAINT data_requests_subject_type_check CHECK(subject_type IN ('STUDENT','PARENT','SCHOOL','ACCOUNT'));
+      `);
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

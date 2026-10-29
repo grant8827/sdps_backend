@@ -221,12 +221,15 @@ async function seedDemoData() {
   await pool.query(`UPDATE users SET active=1 WHERE id = ANY($1) AND email LIKE '%@school.test' AND active=0`, [DEMO_USER_IDS]);
 }
 
+// Only accounts still on the well-known password "password" — one given
+// its own password (e.g. the app store review account) stays usable.
 async function deactivateDemoAccounts() {
-  const result = await pool.query(`UPDATE users SET active=0 WHERE id = ANY($1) AND email LIKE '%@school.test' AND active=1`, [DEMO_USER_IDS]);
-  if (result.rowCount) {
-    await pool.query(`DELETE FROM sessions WHERE user_id = ANY($1)`, [DEMO_USER_IDS]);
-    console.warn(`Deactivated ${result.rowCount} demo account(s) (@school.test, password "password") because SEED_DEMO_DATA is not "true".`);
-  }
+  const { rows } = await pool.query(`SELECT id, password_hash FROM users WHERE id = ANY($1) AND email LIKE '%@school.test' AND active=1`, [DEMO_USER_IDS]);
+  const ids = rows.filter(row => verifyPassword('password', row.password_hash).ok).map(row => row.id);
+  if (!ids.length) return;
+  await pool.query(`UPDATE users SET active=0 WHERE id = ANY($1)`, [ids]);
+  await pool.query(`DELETE FROM sessions WHERE user_id = ANY($1)`, [ids]);
+  console.warn(`Deactivated ${ids.length} demo account(s) (@school.test, password "password") because SEED_DEMO_DATA is not "true".`);
 }
 
 await seedReferenceData();

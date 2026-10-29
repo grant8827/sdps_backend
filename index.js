@@ -1323,6 +1323,60 @@ app.post('/api/admin/school/deletion-request/withdraw', requireAuth, requireScho
   res.status(204).end();
 }));
 
+// Deleting your own account: the public /delete-account page (the link
+// the app stores ask for). The account holder confirms with their sign-in
+// email/phone and password — no session needed, so it works for someone
+// who no longer has the app — and one request per school they belong to
+// joins the Compliance → Data Requests queue, where the platform team
+// reviews it and carries it out within 30 days. Wrong passwords count
+// towards the same lockout as sign-in.
+const ROLE_NAMES = { school_admin: 'School administrator', teacher: 'Teacher', staff: 'Staff', parent: 'Parent or guardian' };
+
+app.post('/api/account/deletion-request', asyncRoute(async (req, res) => {
+  const identifier = String(req.body?.identifier || '').trim();
+  const accountKey = `account:${identifier.toLowerCase()}`;
+  const ipKey = `ip:${req.ip}`;
+  if ((await peekLimit(accountKey)) >= MAX_FAILURES_PER_ACCOUNT || (await peekLimit(ipKey)) >= MAX_FAILURES_PER_IP) {
+    return res.status(429).json({ error: 'Too many failed attempts. Please wait 15 minutes and try again.' });
+  }
+  const user = identifier && await db.prepare('SELECT id, full_name, password_hash FROM users WHERE (LOWER(email)=LOWER(?) OR phone=?) AND active=1').get(identifier, identifier);
+  if (!user || !verifyPassword(String(req.body?.password || ''), user.password_hash).ok) {
+    await hitLimit(accountKey, LOGIN_WINDOW_MS);
+    await hitLimit(ipKey, LOGIN_WINDOW_MS);
+    return res.status(403).json({ error: 'That email/phone and password don\'t match an account.' });
+  }
+  await clearLimit(accountKey);
+  const memberships = await db.prepare(`
+    SELECT school_id AS "schoolId", role FROM memberships WHERE user_id=? AND status='ACTIVE' AND role <> 'platform_super_admin'`).all(user.id);
+  const roles = new Map();
+  for (const m of memberships) roles.set(m.schoolId, [...(roles.get(m.schoolId) ?? []), ROLE_NAMES[m.role] ?? m.role]);
+  if (!roles.size) return res.status(404).json({ error: 'This account isn\'t part of any school, so there is nothing to delete here. Please contact SDPMPlus support.' });
+
+  const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim().slice(0, 2000) : '';
+  const receivedVia = 'Account holder, from the Delete Account page';
+  const dueAt = utcStamp(30);
+  let created = 0;
+  for (const [schoolId, schoolRoles] of roles) {
+    const open = await db.prepare(`
+      SELECT 1 FROM data_requests WHERE school_id=? AND kind='DELETION' AND subject_type='ACCOUNT' AND subject_id=? AND status NOT IN ('COMPLETED','REJECTED')`).get(schoolId, user.id);
+    if (open) continue;
+    const requestId = id('datarequest');
+    const label = `Account: ${user.full_name}`;
+    const relationship = [...new Set(schoolRoles)].join(', ');
+    await db.prepare(`
+      INSERT INTO data_requests (id,school_id,kind,subject_type,subject_id,subject_label,requester_name,requester_relationship,received_via,details,due_at,created_by_user_id)
+      VALUES (?,?,'DELETION','ACCOUNT',?,?,?,?,?,?,?,?)`)
+      .run(requestId, schoolId, user.id, label, user.full_name, relationship, receivedVia, reason || null, dueAt, user.id);
+    await writeAudit({
+      schoolId, actor: user, actorRole: memberships.find(m => m.schoolId === schoolId).role, action: 'DATA_DELETION_REQUESTED',
+      targetType: 'data_request', targetId: requestId, targetLabel: `DELETION · ${label}`,
+      details: { subjectType: 'ACCOUNT', requester: user.full_name, receivedVia }, ip: req.ip, requestId: req.requestId,
+    });
+    created += 1;
+  }
+  res.status(created ? 201 : 200).json({ alreadyRequested: !created, dueAt });
+}));
+
 // Legal & Policies: a school administrator confirms they have read
 // SDPMPlus's legal and policy documents. The dashboard keeps asking until
 // the current versions are confirmed (a document's Last updated date

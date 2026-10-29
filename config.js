@@ -11,6 +11,7 @@ export function configWarnings(env = process.env) {
   const smtp = ['SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASSWORD', 'SMTP_FROM'];
   if (!env.MFA_ENCRYPTION_KEY) warnings.push({ setting: 'MFA_ENCRYPTION_KEY', severity: 'critical', message: 'Two-step verification secrets are not encrypted. Set a 64-character hex key (and never change it afterwards).' });
   if (env.REQUIRE_ADMIN_MFA === 'false') warnings.push({ setting: 'REQUIRE_ADMIN_MFA', severity: 'critical', message: 'Two-step verification is switched off for administrators. Remove this setting in production.' });
+  if (env.MFA_EXEMPT_EMAILS?.trim()) warnings.push({ setting: 'MFA_EXEMPT_EMAILS', severity: 'medium', message: 'Some administrator accounts can sign in without two-step verification (app store review accounts). Remove them when the review is done.' });
   if (env.SEED_DEMO_DATA === 'true') warnings.push({ setting: 'SEED_DEMO_DATA', severity: 'high', message: 'Demo accounts with the password "password" are enabled. Turn this off unless this server is a demo.' });
   if (!env.PUBLIC_APP_URL || /localhost|127\.0\.0\.1/.test(env.PUBLIC_APP_URL)) warnings.push({ setting: 'PUBLIC_APP_URL', severity: 'high', message: 'Links in emails won\'t point at the live website. Set it to https://www.sdpmplus.com.' });
   if (env.PUBLIC_APP_URL && !env.PUBLIC_APP_URL.startsWith('https://')) warnings.push({ setting: 'PUBLIC_APP_URL', severity: 'medium', message: 'Links in emails should use https://.' });
