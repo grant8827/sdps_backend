@@ -1966,7 +1966,14 @@ app.delete('/api/admin/students/:id', requireAuth, requireSchoolAccess('school_a
 app.get('/api/admin/guardians', requireAuth, requireSchoolAccess('school_admin', 'staff'), audited('PARENT_LIST_VIEWED', (req, body) => ({ details: { parentCount: body?.length ?? 0 } })), asyncRoute(async (req, res) => {
   const guardians = await db.prepare(`SELECT DISTINCT gu.id, u.id AS "userId", u.full_name AS "fullName", u.email, u.phone, (u.needs_password_setup=1) AS "needsSetup", m.status FROM guardians gu JOIN users u ON u.id=gu.user_id JOIN memberships m ON m.user_id=u.id WHERE m.school_id=? AND m.role='parent' ORDER BY u.full_name`).all(req.school.id);
   const children = db.prepare(`SELECT s.id, s.first_name || ' ' || s.last_name AS "fullName" FROM student_guardians sg JOIN students s ON s.id=sg.student_id WHERE sg.guardian_id=? AND s.school_id=?`);
-  const result = await Promise.all(guardians.map(async g => ({ ...g, active: g.status === 'ACTIVE', children: await children.all(g.id, req.school.id) })));
+  // Children a parent asked to have this adult authorized for, still
+  // waiting on an admin in Families → Pending Approvals.
+  const pendingChildren = db.prepare(`SELECT DISTINCT s.id, s.first_name || ' ' || s.last_name AS "fullName" FROM guardian_requests gr JOIN students s ON s.id=gr.student_id WHERE gr.guardian_id=? AND gr.school_id=? AND gr.status='PENDING'`);
+  const result = await Promise.all(guardians.map(async g => ({
+    ...g, active: g.status === 'ACTIVE',
+    children: await children.all(g.id, req.school.id),
+    pendingChildren: await pendingChildren.all(g.id, req.school.id),
+  })));
   res.json(result);
 }));
 
@@ -2446,13 +2453,17 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
   const adminNoticeId = id('notice');
   try {
     const result = await withTransaction(async () => {
-      let user = await db.prepare('SELECT id FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
+      // An adult who already has an account (as a parent at this or
+      // another school, or as staff) keeps it: the children are just
+      // requested onto it, and a staff account gets a guardian profile.
+      let user = await db.prepare('SELECT id, full_name FROM users WHERE LOWER(email)=LOWER(?)').get(email.trim());
       let guardianId;
       let created = false;
       if (user) {
+        if (user.id === req.user.id) throw new Error("That's your own account.");
         const guardian = await db.prepare('SELECT id FROM guardians WHERE user_id=?').get(user.id);
-        if (!guardian) throw new Error('This email belongs to a non-parent account');
-        guardianId = guardian.id;
+        guardianId = guardian?.id ?? id('guardian');
+        if (!guardian) await db.prepare('INSERT INTO guardians (id,user_id) VALUES (?,?)').run(guardianId, user.id);
       } else {
         created = true;
         user = { id: id('parent') }; guardianId = id('guardian');
@@ -2469,9 +2480,10 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
       // while one is pending supersedes it (the old one is closed as
       // replaced, kept for history).
       const alreadyLinked = db.prepare('SELECT 1 FROM student_guardians WHERE student_id=? AND guardian_id=?');
+      const adultName = user.full_name || fullName.trim();
       const toRequest = [];
       for (const child of myLinks) if (!(await alreadyLinked.get(child.studentId, guardianId))) toRequest.push(child);
-      if (toRequest.length === 0) throw new Error(`${fullName.trim()} is already authorized for your children.`);
+      if (toRequest.length === 0) throw new Error(`${adultName} is already authorized for your children.`);
 
       const batchId = id('guardianrequest');
       await db.prepare(`UPDATE guardian_requests SET status='REJECTED', decided_by_user_id=?, decided_at=${NOW_UTC}, decision_note='Replaced by a newer request' WHERE guardian_id=? AND status='PENDING' AND student_id = ANY(?)`)
@@ -2482,8 +2494,8 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
       const childNames = toRequest.map(c => c.fullName).join(', ');
       await db.prepare(`INSERT INTO notices (id,school_id,campus_id,sender_user_id,sender_name,sender_role,title,body,target_type) VALUES (?,?,?,?,?,?,?,?,?)`)
         .run(adminNoticeId, membership.schoolId, membership.campusId, req.user.id, req.user.full_name, 'parent',
-          'Guardian awaiting approval', `${req.user.full_name} asked for ${fullName.trim()} (${relationship.trim()}) to be authorized to pick up ${childNames}. Review it in Families → Pending Approvals.`, 'ADMIN');
-      return { guardianId, batchId, toRequest, created, userId: user.id };
+          'Guardian awaiting approval', `${req.user.full_name} asked for ${adultName}${created ? '' : ' (already has an account)'} (${relationship.trim()}) to be authorized to pick up ${childNames}. Review it in Families → Pending Approvals.`, 'ADMIN');
+      return { guardianId, batchId, toRequest, created, userId: user.id, adultName };
     });
     res.locals.audit = {
       schoolId: membership.schoolId, targetType: 'guardian', targetId: result.guardianId,
@@ -2496,7 +2508,7 @@ app.post('/api/me/guardians', requireAuth, requireRole('parent'), audited('PICKU
       })
       : {};
     emailNoticeLater(adminNoticeId);
-    res.status(201).json({ id: result.guardianId, status: 'PENDING', ...invite });
+    res.status(201).json({ id: result.guardianId, status: 'PENDING', existingAccount: !result.created, fullName: result.adultName, students: result.toRequest.map(c => c.fullName), ...invite });
   } catch (error) {
     res.status(400).json({ error: isUniqueViolation(error) ? 'That email is already registered' : error.message });
   }
@@ -2574,6 +2586,12 @@ async function decideGuardianRequest(req, res, approve) {
   const note = typeof req.body.note === 'string' && req.body.note.trim() ? req.body.note.trim().slice(0, 500) : null;
   const first = pending[0];
   await withTransaction(async () => {
+    // A parent who was removed from this school earlier and is now
+    // approved again gets their access back.
+    if (approve) {
+      const adult = await db.prepare('SELECT user_id FROM guardians WHERE id=?').get(first.guardian_id);
+      await db.prepare(`UPDATE memberships SET status='ACTIVE' WHERE user_id=? AND school_id=? AND role='parent' AND status='ARCHIVED'`).run(adult.user_id, req.school.id);
+    }
     for (const item of pending) {
       if (approve) {
         await db.prepare(`

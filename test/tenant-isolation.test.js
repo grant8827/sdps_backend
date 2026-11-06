@@ -352,6 +352,31 @@ test('an adult added by a parent gets no access until an admin approves', async 
   assert.equal(chained.status, 403);
 });
 
+test('a parent adding an adult who already has an account adds the children to that account, pending approval', async () => {
+  const admin = await login('admin@school.test', 'password');
+  const email = `existing-${randomUUID()}@test.local`;
+  assert.equal((await apiCall('POST', '/admin/guardians', admin.token, { fullName: 'Pat Existing', email })).status, 201);
+
+  const parent = await login('morgan@school.test', 'password');
+  const requested = await apiCall('POST', '/me/guardians', parent.token, { fullName: 'Pat (typed by parent)', email: email.toUpperCase(), relationship: 'Aunt' });
+  assert.equal(requested.status, 201);
+  const body = await requested.json();
+  assert.equal(body.status, 'PENDING');
+  assert.equal(body.existingAccount, true);
+  assert.equal(body.fullName, 'Pat Existing');
+  assert.equal(await db.prepare('SELECT COUNT(*)::int AS c FROM users WHERE LOWER(email)=LOWER(?)').get(email).then(r => r.c), 1);
+
+  // Families → Parents shows the child as pending until it's approved.
+  let listed = (await (await apiCall('GET', '/admin/guardians', admin.token)).json()).find(g => g.email === email);
+  assert.deepEqual(listed.children, []);
+  assert.deepEqual(listed.pendingChildren.map(c => c.fullName), ['Casey Kid']);
+  const request = (await (await apiCall('GET', '/admin/guardian-requests', admin.token)).json()).find(r => r.email === email);
+  assert.equal((await apiCall('POST', `/admin/guardian-requests/${request.batchId}/approve`, admin.token, {})).status, 204);
+  listed = (await (await apiCall('GET', '/admin/guardians', admin.token)).json()).find(g => g.email === email);
+  assert.deepEqual(listed.children.map(c => c.fullName), ['Casey Kid']);
+  assert.deepEqual(listed.pendingChildren, []);
+});
+
 test('a rejected adult never gets linked, and the request is kept as history', async () => {
   const parent = await login('morgan@school.test', 'password');
   const email = `uncle-${randomUUID()}@test.local`;
