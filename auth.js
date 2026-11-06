@@ -27,14 +27,18 @@ export async function canSignIn(userId) {
 }
 const hasActiveMembership = { get: canSignIn };
 
-// Two-step verification is mandatory for anyone on the admin dashboard
-// (school admins and front desk staff — users.role 'admin') and for
-// platform admins; optional for teachers and parents, who can turn it
-// on themselves. REQUIRE_ADMIN_MFA=false switches the requirement off
-// (local development/tests only); it never turns off MFA for someone
-// who has already enabled it. MFA_EXEMPT_EMAILS (comma-separated) lets
-// named school-admin accounts — the app store review account — sign in
-// with just a password; platform admins are never exempt.
+// Two-step verification is on by default for anyone on the admin
+// dashboard (school admins and front desk staff — users.role 'admin'):
+// they set it up at their first sign-in, and may then turn it off in
+// Security (users.mfa_opted_out_at), after which they sign in with just
+// a password until they turn it on again. It's mandatory for platform
+// admins, who can never turn it off (mfaLockedFor). Optional and off by
+// default for teachers and parents, who can turn it on themselves.
+// REQUIRE_ADMIN_MFA=false switches the requirement off (local
+// development/tests only); it never turns off MFA for someone who has
+// already enabled it. MFA_EXEMPT_EMAILS (comma-separated) lets named
+// school-admin accounts — the app store review account — sign in with
+// just a password; platform admins are never exempt.
 export const mfaExemptEmails = () => (process.env.MFA_EXEMPT_EMAILS ?? '').split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
 
 export async function mfaRequiredFor(user) {
@@ -42,7 +46,14 @@ export async function mfaRequiredFor(user) {
   const platformAdmin = Boolean(await getPlatformAdmin(user.id));
   if (platformAdmin) return true;
   if (user.role !== 'admin') return false;
+  if (user.mfa_opted_out_at) return false;
   return !(user.email && mfaExemptEmails().includes(user.email.toLowerCase()));
+}
+
+/** Whether this account may not turn two-step verification off (platform admins). */
+export async function mfaLockedFor(user) {
+  if (process.env.REQUIRE_ADMIN_MFA === 'false') return false;
+  return Boolean(await getPlatformAdmin(user.id));
 }
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;

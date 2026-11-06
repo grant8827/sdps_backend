@@ -993,6 +993,13 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 40,
+    name: 'users.mfa_opted_out_at: an admin-dashboard account turned two-step verification off (it is on by default for them)',
+    async up(db) {
+      await db.exec('ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_opted_out_at TEXT');
+    },
+  },
 ];
 
 export async function runMigrations(db, withTransaction) {

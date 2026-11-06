@@ -516,7 +516,7 @@ test('Forgot PIN emails a one-time link that sets a new PIN and nothing else', a
   await db.prepare(`UPDATE students SET pickup_status='PRESENT' WHERE id='child-3'`).run();
 });
 
-test('admins must set up two-step verification, then need a code to sign in', async () => {
+test('admins set up two-step verification at first sign-in, need a code after, and can turn it off', async () => {
   const { totpNow } = await import('../mfa.js');
   process.env.REQUIRE_ADMIN_MFA = 'true';
   try {
@@ -557,9 +557,6 @@ test('admins must set up two-step verification, then need a code to sign in', as
     const reuse = await (await apiCall('POST', '/auth/login', null, { identifier: 'mfa-admin@test.local', password: 'password' })).json();
     assert.equal((await apiCall('POST', '/auth/mfa/verify', null, { mfaToken: reuse.mfaToken, code: recovery })).status, 401);
 
-    // Required accounts can't switch it off.
-    assert.equal((await apiCall('POST', '/me/mfa/disable', signedIn.token, { password: 'password' })).status, 403);
-
     // Five wrong codes and the half-finished sign-in is thrown away.
     const guessing = await (await apiCall('POST', '/auth/login', null, { identifier: 'mfa-admin@test.local', password: 'password' })).json();
     const wrong = totpNow(secret) === '123456' ? '654321' : '123456';
@@ -569,6 +566,18 @@ test('admins must set up two-step verification, then need a code to sign in', as
     const lastTry = await apiCall('POST', '/auth/mfa/verify', null, { mfaToken: guessing.mfaToken, code: wrong });
     assert.equal(lastTry.status, 410);
     assert.equal((await lastTry.json()).restart, true);
+
+    // On by default, but an admin can turn it off (with their password),
+    // and then signs in with just a password, not asked to set it up again.
+    const status = await (await apiCall('GET', '/me/mfa', signedIn.token)).json();
+    assert.equal(status.required, false);
+    assert.equal(status.defaultOn, true);
+    assert.equal((await apiCall('POST', '/me/mfa/disable', signedIn.token, { password: 'wrong-password' })).status, 403);
+    assert.equal((await apiCall('POST', '/me/mfa/disable', signedIn.token, { password: 'password' })).status, 204);
+    assert.ok(await waitForAudit(`action='MFA_DISABLED' AND target_id=?`, ['mfa-admin']));
+    const passwordOnly = await (await apiCall('POST', '/auth/login', null, { identifier: 'mfa-admin@test.local', password: 'password' })).json();
+    assert.ok(passwordOnly.token);
+    assert.equal(passwordOnly.mfaSetupRequired, undefined);
   } finally {
     process.env.REQUIRE_ADMIN_MFA = 'false';
   }
@@ -578,7 +587,7 @@ test('teachers can opt in to two-step verification and turn it off with their pa
   const { totpNow } = await import('../mfa.js');
   await addSchoolUser('mfa-teacher', 'teacher', 'teacher');
   const { token } = await login('mfa-teacher@test.local', 'password');
-  assert.deepEqual(await (await apiCall('GET', '/me/mfa', token)).json(), { enabled: false, enabledAt: null, required: false, recoveryCodesLeft: 0 });
+  assert.deepEqual(await (await apiCall('GET', '/me/mfa', token)).json(), { enabled: false, enabledAt: null, required: false, defaultOn: false, recoveryCodesLeft: 0 });
   const { secret } = await (await apiCall('POST', '/me/mfa/setup', token)).json();
   const { recoveryCodes } = await (await apiCall('POST', '/me/mfa/confirm', token, { code: totpNow(secret) })).json();
   assert.equal(recoveryCodes.length, 10);

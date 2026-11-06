@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { db, id, passwordHash, pool, verifyPassword, isUniqueViolation, withTransaction } from './db.js';
-import { canSignIn, createSession, endAllSessions, endChallenge, failChallenge, findChallenge, login, logout, mfaRequiredFor, requireAuth, requireRole } from './auth.js';
+import { canSignIn, createSession, endAllSessions, endChallenge, failChallenge, findChallenge, login, logout, mfaLockedFor, requireAuth, requireRole } from './auth.js';
 import { superadmin } from './superadmin.js';
 import { emailNoticeLater } from './notifications.js';
 import { startJobWorker } from './jobs.js';
@@ -388,7 +388,7 @@ async function finishEnrollment(user, code) {
   if (step === null) return null;
   const recoveryCodes = newRecoveryCodes();
   await withTransaction(async () => {
-    await db.prepare(`UPDATE users SET mfa_secret=?, mfa_pending_secret=NULL, mfa_enabled_at=${NOW_UTC}, mfa_last_step=? WHERE id=?`).run(encryptSecret(secret), step, user.id);
+    await db.prepare(`UPDATE users SET mfa_secret=?, mfa_pending_secret=NULL, mfa_enabled_at=${NOW_UTC}, mfa_last_step=?, mfa_opted_out_at=NULL WHERE id=?`).run(encryptSecret(secret), step, user.id);
     await replaceRecoveryCodes(user.id, recoveryCodes);
   });
   return recoveryCodes;
@@ -441,14 +441,15 @@ app.post('/api/auth/mfa/setup/confirm', asyncRoute(async (req, res) => {
   res.json({ ...session, recoveryCodes });
 }));
 
-// Managing your own two-step verification while signed in (teachers and
-// parents can opt in here; required accounts can't turn it off).
+// Managing your own two-step verification while signed in. Teachers and
+// parents can opt in here; admin-dashboard accounts have it on by
+// default and can turn it off; platform admins can't (see auth.js).
 const userWithMfa = userId => db.prepare('SELECT * FROM users WHERE id=?').get(userId);
 
 app.get('/api/me/mfa', requireAuth, asyncRoute(async (req, res) => {
   const user = await userWithMfa(req.user.id);
   const left = (await db.prepare('SELECT COUNT(*) AS c FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').get(user.id)).c;
-  res.json({ enabled: Boolean(user.mfa_enabled_at), enabledAt: user.mfa_enabled_at, required: await mfaRequiredFor(user), recoveryCodesLeft: left });
+  res.json({ enabled: Boolean(user.mfa_enabled_at), enabledAt: user.mfa_enabled_at, required: await mfaLockedFor(user), defaultOn: user.role === 'admin', recoveryCodesLeft: left });
 }));
 
 app.post('/api/me/mfa/setup', requireAuth, asyncRoute(async (req, res) => {
@@ -480,10 +481,12 @@ app.post('/api/me/mfa/recovery-codes', requireAuth, asyncRoute(async (req, res) 
 
 app.post('/api/me/mfa/disable', requireAuth, asyncRoute(async (req, res) => {
   const user = await userWithMfa(req.user.id);
-  if (await mfaRequiredFor(user)) return res.status(403).json({ error: 'Two-step verification is required for your account and cannot be turned off.' });
+  if (await mfaLockedFor(user)) return res.status(403).json({ error: 'Two-step verification is required for your account and cannot be turned off.' });
   if (!verifyPassword(String(req.body.password || ''), user.password_hash).ok) return res.status(403).json({ error: 'Password is incorrect.' });
   await withTransaction(async () => {
-    await db.prepare('UPDATE users SET mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL WHERE id=?').run(user.id);
+    // Remembered for admin-dashboard accounts, so their next sign-in
+    // doesn't make them set it up again.
+    await db.prepare(`UPDATE users SET mfa_secret=NULL, mfa_pending_secret=NULL, mfa_enabled_at=NULL, mfa_last_step=NULL, mfa_opted_out_at=${NOW_UTC} WHERE id=?`).run(user.id);
     await db.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').run(user.id);
   });
   await auditForUser(user, 'MFA_DISABLED', req.ip);
